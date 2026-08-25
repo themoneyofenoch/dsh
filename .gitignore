@@ -1,0 +1,13 @@
+# Secrets — NEVER push to GitHub
+.credentials.yaml
+
+# Private session transcripts & machine-local state
+sessions/
+storages/
+
+# Dependencies (too large, reproducible)
+node_modules/
+profiles/**/node_modules/
+
+# macOS junk
+.DS_Store
