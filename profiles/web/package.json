@@ -2,13 +2,16 @@
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
+    "@linxin666/dsh-remote-web-ui": "^0.3.16",
     "@michengai/dsh-automation": "^0.1.31",
     "@tt-a1i/archify-dsh": "0.1.0",
     "@yuxianglin/dsh-bridge-browser": "link:/Users/nakfaai/.dsh/dsh-browser/packages/browser/bridge-browser",
     "dsh-background-nakfaai": "github:themoneyofenoch/dsh-background-nakfaai",
     "dsh-better-sidebar": "0.18.0",
+    "dsh-context": "^0.44.0",
     "dsh-oil-sticky-prompt": "github:oil-oil/dsh-oil-sticky-prompt",
-    "dsh-plugin-doctor": "github:lin-cheng-lab/dsh-plugin-doctor"
+    "dsh-plugin-doctor": "github:lin-cheng-lab/dsh-plugin-doctor",
+    "dshmarket": "^1.44.0"
   },
   "dsh": {
     "profile": {
@@ -21,7 +24,10 @@
         "@tt-a1i/archify-dsh",
         "@michengai/dsh-automation",
         "dsh-oil-sticky-prompt",
-        "@yuxianglin/dsh-bridge-browser"
+        "@yuxianglin/dsh-bridge-browser",
+        "dshmarket",
+        "dsh-context",
+        "@linxin666/dsh-remote-web-ui"
       ]
     }
   }
