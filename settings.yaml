@@ -6,3 +6,5 @@ agent-default-model:
   provider: deepseek-official
   model: deepseek-v4-flash-vision-exp
   reasoningEffort: high
+llm-pi-ai:
+  providers: {}
