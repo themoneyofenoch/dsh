@@ -21,8 +21,8 @@ importers:
         specifier: github:themoneyofenoch/dsh-background-nakfaai
         version: https://codeload.github.com/themoneyofenoch/dsh-background-nakfaai/tar.gz/3fed1bdc38829f84c0a23f46d49c2b35ac623ab5
       dsh-better-sidebar:
-        specifier: 0.18.0-alpha.0
-        version: 0.18.0-alpha.0
+        specifier: 0.18.0
+        version: 0.18.0
       dsh-oil-sticky-prompt:
         specifier: github:oil-oil/dsh-oil-sticky-prompt
         version: https://codeload.github.com/oil-oil/dsh-oil-sticky-prompt/tar.gz/5c032d0df3ad952a64f6ed3c50e375f5efaeadf7
@@ -498,24 +498,24 @@ packages:
     resolution: {gitHosted: true, integrity: sha512-UvisSHyt25UShh/RCteVOX4H+5XGBr8v25++ArJ4D+q5mDHJattQGb1AZior/xcHMspGItq4NyDsOYlVCidT7Q==, tarball: https://codeload.github.com/themoneyofenoch/dsh-background-nakfaai/tar.gz/3fed1bdc38829f84c0a23f46d49c2b35ac623ab5}
     version: 0.1.0
 
-  dsh-better-sidebar@0.18.0-alpha.0:
-    resolution: {integrity: sha512-XcJLX6IaZecJ1mKebgTE52/sB/QIvVBmDfR77Wos0jnjtj2cZEUEDlFixySzwyiVMvVJfy5qQlsITpAps5pd4w==}
+  dsh-better-sidebar@0.18.0:
+    resolution: {integrity: sha512-6sGUIpgrFLXikACKBXLSiyngULceZCIr5M4bLw2IdCJ3KWHcbNsJJl+TLHJw0lM9voRw0etbr5fC16VQ9YvshQ==}
     engines: {node: '>=20'}
     peerDependencies:
-      '@deepseek-ai/cordis': ^4.0.1
-      '@deepseek-ai/dsh-agent': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-client-locale': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-client-ui-conversation': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-client-ui-primitives': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-client-ui-settings': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-client-ui-slots': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-host-webserver': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-invariants': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-llm': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-session': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-settings': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-subagent': ^0.1.2-alpha.2
-      '@deepseek-ai/dsh-tools': ^0.1.2-alpha.2
+      '@deepseek-ai/cordis': ^4.0.2
+      '@deepseek-ai/dsh-agent': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-client-locale': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-client-ui-conversation': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-client-ui-primitives': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-client-ui-settings': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-client-ui-slots': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-host-webserver': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-invariants': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-llm': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-session': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-settings': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-subagent': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-tools': ^0.1.2-rc.1
       '@huanlin/dsh-plugin-better-locale': ^0.1.0
       react: ^18.2.0
       react-dom: ^18.2.0
@@ -1304,7 +1304,7 @@ snapshots:
 
   dsh-background-nakfaai@https://codeload.github.com/themoneyofenoch/dsh-background-nakfaai/tar.gz/3fed1bdc38829f84c0a23f46d49c2b35ac623ab5: {}
 
-  dsh-better-sidebar@0.18.0-alpha.0:
+  dsh-better-sidebar@0.18.0:
     dependencies:
       '@codemirror/commands': 6.11.0
       '@codemirror/lang-cpp': 6.0.3

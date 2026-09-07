@@ -6,7 +6,7 @@
     "@tt-a1i/archify-dsh": "0.1.0",
     "@yuxianglin/dsh-bridge-browser": "link:/Users/nakfaai/.dsh/dsh-browser/packages/browser/bridge-browser",
     "dsh-background-nakfaai": "github:themoneyofenoch/dsh-background-nakfaai",
-    "dsh-better-sidebar": "0.18.0-alpha.0",
+    "dsh-better-sidebar": "0.18.0",
     "dsh-oil-sticky-prompt": "github:oil-oil/dsh-oil-sticky-prompt",
     "dsh-plugin-doctor": "github:lin-cheng-lab/dsh-plugin-doctor"
   },
@@ -19,9 +19,9 @@
         "dsh-background-nakfaai",
         "dsh-better-sidebar",
         "@tt-a1i/archify-dsh",
-        "@yuxianglin/dsh-bridge-browser",
         "@michengai/dsh-automation",
-        "dsh-oil-sticky-prompt"
+        "dsh-oil-sticky-prompt",
+        "@yuxianglin/dsh-bridge-browser"
       ]
     }
   }
