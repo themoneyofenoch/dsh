@@ -4,7 +4,14 @@ ui-theme:
   preference: system
 agent-default-model:
   provider: deepseek-official
-  model: deepseek-v4-flash-vision-exp
-  reasoningEffort: high
+  model: deepseek-v4.1-flash-expires-on-0910
+  reasoningEffort: low
 llm-pi-ai:
   providers: {}
+agent-presets:
+  default: code
+dsh-better-sidebar:
+  tabsEnabled:
+    sidechat: false
+    editor: false
+    diff: false

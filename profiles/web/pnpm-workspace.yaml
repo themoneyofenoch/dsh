@@ -6,3 +6,4 @@ autoInstallPeers: false
 allowBuilds:
   node-pty: true
   cloudflared: true
+  '@wxg-prc-cpg/browser-skill-dsh-plugin@https://codeload.github.com/Tencent/BrowserSkill/tar.gz/3c5f838c56b5f5f20632804bab83b8a98fea5bf2#path:/packages/dsh-plugin-browserskill': true
