@@ -1,0 +1,1189 @@
+#!/usr/bin/env python3
+"""apps-evidence — the owner-proof page (readable edition).
+
+Reads /Users/nakfaai/.dsh/state/apps-status.json (what the stores actually say),
+/Users/nakfaai/.dsh/state/apps-pending.json (what waits on Ammaniel's yes) and
+every app's evidence folder /Users/nakfaai/output/apps/evidence/<slug>/ (what
+its own Bot proved), then writes /Users/nakfaai/output/apps/evidence.html.
+
+The page leads with the verdict and the pictures. The Bot's long report is
+rendered as real markdown behind one fold, so the proof stays one click deep
+instead of a wall of raw pipes and hashes. Nothing here is typed by hand: a
+fact shows only if it is in the JSON, in a STATUS.md, or in a file under the
+app's evidence folder.
+
+  apps-evidence            read + write the page
+  apps-evidence page       re-render only (same thing)
+"""
+import html
+import json
+import os
+import re
+import struct
+import sys
+from datetime import datetime
+
+STATE = "/Users/nakfaai/.dsh/state/apps-status.json"
+PENDING = "/Users/nakfaai/.dsh/state/apps-pending.json"
+DECISIONS = "/Users/nakfaai/.dsh/state/apps-decisions.jsonl"  # taps from the page
+EVID = "/Users/nakfaai/output/apps/evidence"
+ICONS = "/Users/nakfaai/output/apps/icons"
+OUT = "/Users/nakfaai/output/apps/evidence.html"
+APPS_PAGE = "/Users/nakfaai/output/apps/status.html"
+PROJ_PAGE = "/Users/nakfaai/output/projects/status.html"
+OWNER = {"kalkidan": "Kalkidan", "pixwee": "Pixwee", "netbrew": "Netbrew", "geezeasy": "GeezEsay"}
+
+IMG_RE = re.compile(r"\.(png|jpe?g)$", re.I)
+DTYPE = {
+    "APP_IPHONE_65": "iPhone 6.5″ · 1242×2688",
+    "APP_IPHONE_67": "iPhone 6.7″ · 1290×2796",
+    "APP_IPHONE_69": "iPhone 6.9″ · 1320×2868",
+    "APP_IPHONE_61": "iPhone 6.1″",
+    "APP_IPHONE_47": "iPhone 4.7″",
+    "APP_IPAD_PRO_129": "iPad 12.9″ · 2048×2732",
+    "APP_IPAD_PRO_3GEN_129": "iPad 12.9″ 3rd gen · 2064×2752",
+    "APP_IPAD_PRO_3GEN_11": "iPad 11″ · 1668×2388",
+}
+SHORT_SIZE = {
+    "APP_IPHONE_65": "6.5″", "APP_IPHONE_67": "6.7″", "APP_IPHONE_69": "6.9″",
+    "APP_IPHONE_61": "6.1″", "APP_IPHONE_47": "4.7″",
+    "APP_IPAD_PRO_129": "12.9″", "APP_IPAD_PRO_3GEN_129": "12.9″ 3rd",
+    "APP_IPAD_PRO_3GEN_11": "11″",
+}
+SET_LABEL = {
+    "iap-review-screens": ("Purchase review screens", "the sheet Apple shows beside each in-app purchase"),
+    "proposals": ("Proposed artwork", "made, not uploaded yet"),
+    "fresh": ("Apple 6.7″ · fresh capture", "1290×2796"),
+    "play": ("Google Play · live on the store", "downloaded from the console"),
+    "play-fresh": ("Google Play · fresh capture", "1080×2340"),
+    "play-phone": ("Google Play phone screenshots", ""),
+    "iphone-1290x2796": ("iPhone 6.7″", "1290×2796"),
+    "ipad-2064x2752": ("iPad 13″", "2064×2752"),
+    "share": ("Share sheet", ""),
+    "apple-iphone-6.7": ("iPhone 6.7″", "1290×2796"),
+    "apple-iphone-6.9": ("iPhone 6.9″", ""),
+    "apple-iphone-6.1": ("iPhone 6.1″", ""),
+    "apple-iphone-4.7": ("iPhone 4.7″", ""),
+}
+DIR_RANK = ["iap-review-screens", "proposals", "shots/apple", "shots/fresh", "shots/play-fresh",
+            "shots/play", "shots/play-phone", "shots", "shots/iphone-1290x2796",
+            "shots/ipad-2064x2752", "shots/share"]
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def inline(s):
+    s = esc(s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    return s
+
+
+def render_table(rows):
+    grid = []
+    for r in rows:
+        cells = [c.strip() for c in r.strip().strip("|").split("|")]
+        if cells and all(re.fullmatch(r":?-{2,}:?", c or "") for c in cells):
+            continue
+        grid.append(cells)
+    if not grid:
+        return ""
+    head, body = grid[0], grid[1:]
+    out = ['<table class="md"><thead><tr>']
+    out += ["<th>%s</th>" % inline(c) for c in head]
+    out.append("</tr></thead><tbody>")
+    for row in body:
+        out.append("<tr>" + "".join("<td>%s</td>" % inline(c) for c in row) + "</tr>")
+    out.append("</tbody></table>")
+    return "".join(out)
+
+
+def render_md(body):
+    lines = body.splitlines()
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        s = lines[i].strip()
+        if not s:
+            i += 1
+            continue
+        if s.startswith("|") and s.endswith("|"):
+            rows = []
+            while i < n and lines[i].strip().startswith("|"):
+                rows.append(lines[i].strip())
+                i += 1
+            out.append(render_table(rows))
+            continue
+        if s.startswith("### "):
+            out.append("<h5>%s</h5>" % inline(s[4:]))
+        elif s.startswith("## "):
+            out.append("<h4>%s</h4>" % inline(s[3:]))
+        elif s.startswith("# "):
+            out.append("<h3>%s</h3>" % inline(s[2:]))
+        elif s in ("---", "***", "___"):
+            out.append("<hr>")
+        elif s.startswith(("- ", "* ")):
+            items = []
+            while i < n and lines[i].strip().startswith(("- ", "* ")):
+                items.append(inline(lines[i].strip()[2:]))
+                i += 1
+            out.append("<ul>" + "".join("<li>%s</li>" % x for x in items) + "</ul>")
+            continue
+        elif re.match(r"^\d+[.)]\s+", s):
+            items = []
+            while i < n and re.match(r"^\d+[.)]\s+", lines[i].strip()):
+                items.append(inline(re.sub(r"^\d+[.)]\s+", "", lines[i].strip())))
+                i += 1
+            out.append("<ol>" + "".join("<li>%s</li>" % x for x in items) + "</ol>")
+            continue
+        else:
+            out.append("<p>%s</p>" % inline(s))
+        i += 1
+    return "\n".join(out)
+
+
+def load_json(p, default):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def status_md(slug):
+    p = os.path.join(EVID, slug, "STATUS.md")
+    if not os.path.isfile(p):
+        return None, None
+    with open(p, encoding="utf-8") as f:
+        body = f.read()
+    return body, datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
+
+
+def img_size(path):
+    """(width, height) read straight from the file header; (0, 0) when unknown."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(26)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                return struct.unpack(">II", head[16:24])
+            if head[:2] == b"\xff\xd8":
+                f.seek(2)
+                while True:
+                    b = f.read(1)
+                    if not b:
+                        break
+                    if b != b"\xff":
+                        continue
+                    m = f.read(1)
+                    while m == b"\xff":
+                        m = f.read(1)
+                    if m[0] in (0xD8, 0xD9) or not m:
+                        continue
+                    ln = int.from_bytes(f.read(2), "big")
+                    if 0xC0 <= m[0] <= 0xCF and m[0] not in (0xC4, 0xC8, 0xCC):
+                        d = f.read(5)
+                        return int.from_bytes(d[3:5], "big"), int.from_bytes(d[1:3], "big")
+                    f.seek(ln - 2, 1)
+    except Exception:
+        pass
+    return (0, 0)
+
+
+ART_RE = re.compile(r"(icon|feature[-_ ]?graphic|feature|banner)", re.I)
+
+
+def _label_of(key):
+    seg = key.split("/")[-1] if key else "shots"
+    for k in (key, seg):
+        if k in SET_LABEL:
+            return SET_LABEL[k]
+    if seg in ("shots", ""):
+        return ("Screenshots", "")
+    return (seg.replace("-", " ").replace("_", " ").title(), "")
+
+
+def _rank_of(key):
+    seg = key.split("/")[-1] if key else ""
+    for k in (key, seg):
+        if k in DIR_RANK:
+            return DIR_RANK.index(k)
+    for pre, r in (("apple", 2), ("fresh", 3), ("play-fresh", 4), ("play", 5),
+                   ("iphone", 8), ("ipad", 9), ("share", 10)):
+        if seg.startswith(pre):
+            return r
+    return 50
+
+
+THUMB_DIR = "/Users/nakfaai/output/apps/evidence/_thumbs"
+
+LABEL_ORDER = ["iPhone 6.9", "iPhone 6.7", "iPhone 6.5", "iPhone 6.1", "iPhone 4.7",
+               "iPad 13", "iPad 12.9 · 2048", "iPad 12.9", "iPad 11"]
+
+
+def _lab_rank(label):
+    for i, pre in enumerate(LABEL_ORDER):
+        if label.startswith(pre):
+            return i
+    return 50
+
+
+def thumb_abs(path, slug):
+    """Small JPEG twin of a screenshot, cached by size+mtime. None if unreadable."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    rel = os.path.relpath(path, os.path.join(EVID, slug))
+    key = re.sub(r"[^A-Za-z0-9]+", "_", rel).strip("_")[:120]
+    key = "%s-%d-%d" % (key, st.st_size, int(st.st_mtime))
+    out = os.path.join(THUMB_DIR, slug, key + ".jpg")
+    if os.path.exists(out) and os.path.getmtime(out) >= st.st_mtime:
+        return out
+    try:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        from PIL import Image
+        im = Image.open(path).convert("RGB")
+        im.thumbnail((330, 700), Image.LANCZOS)
+        im.save(out, "JPEG", quality=82, optimize=True)
+        return out
+    except Exception:
+        return None
+
+
+def _finish(sets):
+    """Sort, split store art from screenshots, and measure each set."""
+    out = []
+    art_all = []
+    for st in sets:
+        art = [n for n in st["files"] if ART_RE.search(n)]
+        shots = [n for n in st["files"] if not ART_RE.search(n)]
+        art_all.extend((st["rel"], n) for n in art)
+        if shots:
+            out.append(dict(st, files=shots))
+    if art_all:
+        out.append({"slug": sets[0]["slug"] if sets else "", "rel": "",
+                    "label": "Store art · icon and feature graphic", "note": "",
+                    "files": [n for _r, n in art_all], "rank": 90,
+                    "rels": [r for r, _n in art_all]})
+    for st in out:
+        rels = st.get("rels") or [st["rel"]] * len(st["files"])
+        paths = [os.path.join(EVID, st["slug"], r, n) if r
+                 else os.path.join(EVID, st["slug"], n) for r, n in zip(rels, st["files"][:3])]
+        sizes = [img_size(p) for p in paths]
+        sizes = [(w, h) for w, h in sizes if w and h]
+        st["wide"] = bool(sizes) and sum(1 for w, h in sizes if w > h) > len(sizes) / 2
+        st["caption"] = (st["files"][0].rsplit("-", 1)[0] + "-" if len(st["files"]) > 1 and
+                         re.match(r"^([A-Z0-9_]{3,})-\d+\.", st["files"][0]) else "")
+    out.sort(key=lambda s: (s["rank"], _lab_rank(s["label"]), s["label"]))
+    return out
+
+
+CAND_REL = "shots/candidates"
+PICK_MAX = 10
+
+
+def pick_files(slug):
+    """The 24 candidates the app's Bot shot — the pictures Ammaniel ticks his 10 from."""
+    d = os.path.join(EVID, slug, CAND_REL)
+    if not os.path.isdir(d):
+        return []
+    return [n for n in sorted(os.listdir(d))
+            if IMG_RE.search(n) and not n.startswith(("_", "t-"))]
+
+
+def pick_num(n, i):
+    m = re.match(r"^(\d{1,2})[-_.]", n)
+    return int(m.group(1)) if m else i + 1
+
+
+def picks_html(apps):
+    """The tap-to-tick grid: every candidate on the page, his 10 kept in the order he taps."""
+    groups, total = [], 0
+    for a in apps:
+        slug = a.get("slug") or ""
+        name = a.get("name") or slug
+        files = pick_files(slug)
+        total += len(files)
+        if not files:
+            groups.append(
+                '<div class="pickapp" data-app="%s" id="pick-%s"><div class="pickhead"><b>%s</b>'
+                '<span class="picks-note">no candidates on disk yet</span></div></div>'
+                % (esc(slug), esc(slug), esc(name)))
+            continue
+        cards = []
+        for i, n in enumerate(files):
+            rel = "evidence/%s/%s/%s" % (slug, CAND_REL, n)
+            full = os.path.join(EVID, slug, CAND_REL, n)
+            t = thumb_abs(full, slug)
+            src = os.path.relpath(t, os.path.dirname(OUT)) if t else rel
+            short = re.sub(r"^\d{1,2}[-_.]", "", n).rsplit(".", 1)[0].replace("-", " ")
+            cards.append(
+                '<div class="pcard" role="checkbox" aria-checked="false" tabindex="0" '
+                'data-app="%s" data-file="%s" title="%s">'
+                '<span class="tick">&#10003;</span>'
+                '<img decoding="async" loading="lazy" src="%s" alt="%s">'
+                '<div class="pmeta"><b>%d</b><span class="pname">%s</span>'
+                '<a class="open" href="%s" target="_blank" rel="noopener">&#8599;</a></div></div>'
+                % (esc(slug), esc(n), esc(n), esc(src), esc(n), pick_num(n, i), esc(short), esc(rel)))
+        note = ""
+        if len(files) < PICK_MAX:
+            note = '<span class="picks-note">%d on disk &mdash; %s Bot still shooting</span>' % (
+                len(files), esc(name))
+        groups.append(
+            '<div class="pickapp" data-app="%s" id="pick-%s">'
+            '<div class="pickhead"><b>%s</b><span class="pickcount">0 of %d picked</span>%s</div>'
+            '<div class="pickgrid">%s</div></div>'
+            % (esc(slug), esc(slug), esc(name), PICK_MAX, note, "".join(cards)))
+    if not groups:
+        return ""
+    return ('<section class="picks" id="picks"><h2>Screenshots &mdash; tap your 10'
+            '<span class="cnt" id="picktotal">0 of %d ticked</span></h2>'
+            '<p class="picks-lead">Tap a picture to tick it, tap again to drop it. '
+            'The order you tap is the order they go into the store; Apple takes 10 and Play takes the '
+            'first 8. Each tap saves as you go. &#8599; opens one full size.</p>%s</section>'
+            % (total, "".join(groups)))
+
+
+def image_sets(slug):
+    """Every folder of screenshots under the app's evidence dir, as named sets."""
+    root = os.path.join(EVID, slug)
+    if not os.path.isdir(root):
+        return []
+    found = []
+    for cur, _dirs, files in os.walk(root):
+        if os.path.relpath(cur, root).replace(os.sep, "/").endswith(CAND_REL):
+            continue
+        imgs = sorted(n for n in files if IMG_RE.search(n))
+        if not imgs:
+            continue
+        rel = os.path.relpath(cur, root).replace(os.sep, "/")
+        rel = "" if rel == "." else rel
+        key = rel or "shots"
+        label, note = _label_of(key)
+        rank = _rank_of(key)
+        pref = re.match(r"^([A-Z0-9_]{3,})-\d+\.(png|jpe?g)$", imgs[0], re.I)
+        if pref and all(re.match(r"^([A-Z0-9_]{3,})-\d+\.(png|jpe?g)$", n, re.I) for n in imgs):
+            by = {}
+            for n in imgs:
+                by.setdefault(re.match(r"^([A-Z0-9_]{3,})-\d+\.", n, re.I).group(1), []).append(n)
+            for p, names in by.items():
+                found.append({"slug": slug, "rel": rel, "label": DTYPE.get(p, label + " · " + p),
+                              "note": "", "files": names, "rank": rank})
+            continue
+        found.append({"slug": slug, "rel": rel, "label": label, "note": note,
+                      "files": imgs, "rank": rank})
+    return _finish(found)
+
+
+def shots_html(slug):
+    sets = image_sets(slug)
+    if not sets:
+        return ('<p class="empty">⚪ No screenshots in the evidence folder yet — '
+                '<code>%s/%s/</code> holds only a report.</p>' % (EVID, slug))
+    blocks = []
+    for st in sets:
+        thumbs = []
+        pref = st.get("caption") or ""
+        rels = st.get("rels") or [st["rel"]] * len(st["files"])
+        for n, r in zip(st["files"], rels):
+            rel = "evidence/%s/%s" % (slug, (r + "/" + n) if r else n)
+            full = os.path.join(EVID, slug, r, n) if r else os.path.join(EVID, slug, n)
+            t = thumb_abs(full, slug)
+            src = (os.path.relpath(t, os.path.dirname(OUT)) if t else rel)
+            cap = n[len(pref):].rsplit(".", 1)[0] if pref and n.startswith(pref) else n.rsplit(".", 1)[0]
+            thumbs.append(
+                '<a class="shot" href="%s" target="_blank" title="%s"><img decoding="async" src="%s" alt="%s">'
+                '<span>%s</span></a>' % (esc(rel), esc(n), esc(src), esc(n), esc(cap)))
+        more = ""
+        if len(st["files"]) > 8:
+            links = "".join(
+                '<li><a href="%s" target="_blank">%s</a></li>' % (
+                    esc("evidence/%s/%s" % (slug, (r + "/" + n) if r else n)), esc(n))
+                for n, r in zip(st["files"], rels))
+            more = ('<details class="files"><summary>All %d files</summary><ul>%s</ul></details>'
+                    % (len(st["files"]), links))
+        note = (' <em>%s</em>' % esc(st["note"])) if st["note"] else ""
+        blocks.append(
+            '<div class="set"><div class="sethead"><b>%s</b>%s<span>%d %s</span></div>'
+            '<div class="strip%s">%s</div>%s</div>'
+            % (esc(st["label"]), note, len(st["files"]), "shot" if len(st["files"]) == 1 else "shots",
+               " wide" if st["wide"] else "", "".join(thumbs), more))
+    return "".join(blocks)
+
+
+def tile(label, value, lines, cls=""):
+    sub = "".join("<span>%s</span>" % x for x in lines if x)
+    return ('<div class="tile %s"><div class="tl">%s</div><div class="tv">%s</div>%s</div>'
+            % (cls, esc(label), value, sub))
+
+
+def track_bits(play):
+    tracks = play.get("tracks") or {}
+    bits, reds = [], []
+    for t in ("production", "beta", "alpha", "internal"):
+        tr = tracks.get(t)
+        if not tr:
+            bits.append('<span class="m">%s empty</span>' % t)
+            if t in ("production", "beta"):
+                reds.append("")
+        else:
+            vc = ",".join(tr.get("versionCodes") or [])
+            bits.append('%s vc %s <span class="m">%s</span>' % (t, esc(vc), esc(tr.get("status"))))
+    return bits, reds
+
+
+SRC_WORDS = ("Apple", "Play", "GitHub", "Xcode Cloud", "Google Play", "App Store")
+
+
+def missing_li(m):
+    """One red, with its source as a small badge and Apple's keys said in plain words."""
+    for k, v in SHORT_SIZE.items():
+        m = m.replace(k, v)
+    m = re.sub(r"\b1 files\b", "1 file", m)
+    if ": " in m:
+        src, rest = m.split(": ", 1)
+        if src in SRC_WORDS:
+            return '<li><span class="dot dr"></span><span><b class="src">%s</b>%s</span></li>' % (
+                esc(src), inline(rest))
+    return '<li><span class="dot dr"></span>%s</li>' % inline(m)
+
+
+def missing_of(app):
+    """Every red the store/git/Xcode-Cloud reads measured, in one plain list."""
+    apple = app.get("apple") or {}
+    ci = apple.get("ci") or {}
+    play = app.get("play") or {}
+    repo = app.get("repo") or {}
+    out = []
+    for src in (apple, ci, play, repo):
+        for r in (src.get("reds") or []):
+            if r not in out:
+                out.append(r)
+    for r in (app.get("reds") or []):
+        tail = r.split(":", 1)[-1].strip()
+        if r in out:
+            continue
+        if any(tail and tail in x for x in out):
+            continue
+        out.append(r)
+    for note in (apple.get("notes") or []):
+        if note.startswith(("no iPad", "thin screenshots")) and note not in out:
+            out.append("Apple: " + note)
+    return out
+
+
+KIND_LABEL = {"clear": "Clear", "gray": "Grey"}
+
+
+def answered(rec):
+    """A saved answer as a chip, or the two buttons when it is still open."""
+    if not rec:
+        return ('<button class="y" data-v="yes">Yes</button>'
+                '<button class="h" data-v="hold">Hold</button>')
+    when = esc((rec.get("at") or "")[11:16])
+    if (rec.get("answer") or "").lower() == "yes":
+        return '<span class="saved">✅ yes · %s</span>' % when
+    return '<span class="saved hold">🟡 hold · %s</span>' % when
+
+
+def norm_steps(wait):
+    """Pending steps as dicts: step/kind/pick/why. A plain string is clear + yes."""
+    out = []
+    for w in (wait or []):
+        if isinstance(w, str):
+            out.append({"step": w, "kind": "clear", "pick": "yes", "why": ""})
+        elif isinstance(w, dict):
+            out.append({"step": w.get("step") or "", "kind": (w.get("kind") or "clear").lower(),
+                        "pick": (w.get("pick") or "yes").lower(), "why": w.get("why") or ""})
+    return out
+
+
+def app_card(app, pending):
+    slug = app.get("slug")
+    name = app.get("name") or slug
+    bot = OWNER.get(slug, "its own Bot")
+    play = app.get("play") or {}
+    apple = app.get("apple") or {}
+    repo = app.get("repo") or {}
+    ci = apple.get("ci") or {}
+    cur = apple.get("current") or {}
+    build = cur.get("build") or {}
+    nb = apple.get("newestBuild")
+    nb_ver = str(nb) if isinstance(nb, (int, str)) and str(nb) not in ("", "None") else ""
+    body, when = status_md(slug)
+
+    # ---------- missing: every red the state JSON measured, section by section
+    missing = missing_of(app)
+    missing_html = ("".join(missing_li(m) for m in missing)
+                    or '<li class="clear"><span class="dot dg"></span>Nothing missing on either store.</li>')
+
+    # ---------- waiting on him
+    wait = norm_steps(pending)
+    wait_html = ("".join('<li><span class="num">%d</span>%s</li>' % (i + 1, inline(w["step"]))
+                         for i, w in enumerate(wait))
+                 or '<li class="clear"><span class="dot dg"></span>Nothing waiting on you.</li>')
+
+    # ---------- next action
+    if wait:
+        nxt = ""
+        nxt_cls = ""
+    elif str(cur.get("state") or "") in ("WAITING_FOR_REVIEW", "IN_REVIEW"):
+        nxt = "⏳ In Apple's review — nothing needed from you"
+        nxt_cls = "blue"
+    elif apple.get("live"):
+        nxt = "✅ Live on the store — nothing needed from you"
+        nxt_cls = "green"
+    else:
+        nxt = "✅ Nothing needed from you"
+        nxt_cls = "green"
+
+    # ---------- tiles
+    a_state = esc(cur.get("state") or "no version")
+    a_val = '%s <span class="m">%s</span>' % (esc(cur.get("version") or "—"), a_state)
+    a_lines = []
+    if build:
+        a_lines.append("build %s attached · %s" % (esc(build.get("version") or "?"), esc(build.get("state") or "")))
+    else:
+        a_lines.append("no build attached")
+    if nb_ver and nb_ver != str(build.get("version") or ""):
+        a_lines.append("newest uploaded build %s" % esc(nb_ver))
+    if apple.get("live"):
+        a_lines.append("live %s build %s" % (esc(apple["live"].get("version")), esc(apple["live"].get("build"))))
+    shots_d = apple.get("shots") or {}
+    if shots_d:
+        total = sum(shots_d.values())
+        thin = [(k, v) for k, v in shots_d.items() if v < 3]
+        line = "shots %d in %d size%s" % (total, len(shots_d), "" if len(shots_d) == 1 else "s")
+        if thin:
+            line += " · thin: " + ", ".join("%s %d" % (SHORT_SIZE.get(k, k), v) for k, v in thin)
+        a_lines.append(line)
+    else:
+        a_lines.append("no screenshot sets")
+    a_cls = "red" if (not build or shots_d.get("APP_IPAD_PRO_129", 1) == 0 or shots_d.get("APP_IPAD_PRO_3GEN_129", 1) == 0) else ""
+
+    tracks = play.get("tracks") or {}
+    prod = tracks.get("production") or {}
+    if prod and (prod.get("versionCodes") or []):
+        p_val = "live vc %s" % esc(",".join(prod["versionCodes"]))
+        p_cls = ""
+    else:
+        p_val = '<span class="m">production</span> empty'
+        p_cls = "red"
+    closed = []
+    for t in ("alpha", "internal"):
+        tr = tracks.get(t)
+        if tr:
+            closed.append("%s vc %s <span class=\"m\">%s</span>"
+                          % (t, esc(",".join(tr.get("versionCodes") or [])), esc(tr.get("status") or "")))
+    p_lines = closed if closed else ["no testing track"]
+    imgs = play.get("playImages") or {}
+    if imgs:
+        want = (("phoneScreenshots", "phone"), ("icon", "icon"), ("featureGraphic", "feature graphic"))
+        p_lines.append("images " + " · ".join("%s %s" % (lab, imgs.get(k, 0)) for k, lab in want))
+        if not imgs.get("phoneScreenshots") or not imgs.get("icon"):
+            p_cls = "red"
+    else:
+        p_lines.append("images not read")
+
+    b_val = '<span class="m">newest build</span> %s' % esc(nb_ver or "—")
+    b_lines = []
+    if ci.get("run"):
+        run = ci["run"]
+        ok = run.get("status") == "SUCCEEDED"
+        b_lines.append("Xcode Cloud #%s %s" % (esc(run.get("number")), esc(run.get("status"))))
+        b_cls = "" if ok else "red"
+        b_val = '<span class="m">newest build</span> %s' % esc(nb_ver or "—")
+    else:
+        b_lines.append("Xcode Cloud not read")
+        b_cls = ""
+
+    dirty = repo.get("dirty")
+    r_val = "%s <span class=\"m\">@ %s</span>" % (esc(repo.get("branch") or "—"), esc(repo.get("head") or ""))
+    r_lines = ["%s file%s to commit" % (esc(dirty), "" if dirty == 1 else "s") if dirty else "clean tree"]
+    r_cls = "red" if dirty else ""
+
+    facts = (tile("App Store", a_val, a_lines, a_cls) +
+             tile("Google Play", "", p_lines, p_cls) +
+             tile("Build train", b_val, b_lines, b_cls) +
+             tile("GitHub", r_val, r_lines, r_cls))
+
+    notes = [n for n in (app.get("notes") or []) if "not checked" in n]
+    notes_html = ("".join('<span class="nc">Not checked yet: %s</span>'
+                          % esc(n.split(":", 1)[0].strip()) for n in notes))
+
+    if body:
+        report = ('<details class="report"><summary>Full report — written %s by %s '
+                  '<span class="hint">opens the raw evidence</span></summary><div class="mdbody">%s</div></details>'
+                  % (esc(when), esc(bot), render_md(body)))
+    else:
+        report = ('<div class="empty">⚪ %s has not written a report yet — nothing to show.</div>' % esc(bot))
+
+    icon = os.path.join(ICONS, slug + ".png")
+    icon_html = ('<img class="icon" src="%s" alt="">' % esc("icons/%s.png" % slug)) if os.path.isfile(icon) else ""
+
+    verdict_cls = "red" if missing else "green"
+    verdict = "%d missing" % len(missing) if missing else "nothing missing"
+
+    return """
+<article class="app %(vcls)s" id="%(slug)s" data-missing="%(nmiss)d">
+  <div class="apphead">
+    %(icon)s
+    <div class="titles">
+      <h2>%(name)s</h2>
+      <p class="pkg">%(pkg)s · store page owned by <b>%(bot)s</b></p>
+    </div>
+    <div class="verdict %(vcls)s">%(verdict)s</div>
+  </div>
+
+  <div class="facts">%(facts)s</div>
+
+  <div class="twocol">
+    <section class="block missing"><h3>Missing <span class="count">%(nmiss)d</span></h3><ul>%(missing)s</ul></section>
+    <section class="block waiting"><h3>Waiting on your yes <span class="count amber">%(nwait)d</span></h3><ol>%(wait)s</ol></section>
+  </div>
+
+  %(nextblock)s
+  %(notes)s
+
+  <details class="shotsfold" open><summary>Screenshots — what it produced</summary>%(shots)s</details>
+  %(report)s
+</article>
+""" % dict(slug=esc(slug), name=esc(name), pkg=esc(app.get("playPackage") or app.get("bundleId") or ""),
+           bot=esc(bot), icon=icon_html, vcls=verdict_cls, verdict=verdict, nmiss=len(missing),
+           facts=facts, missing=missing_html, nwait=len(wait), wait=wait_html,
+           nextblock=('<p class="next %s">%s</p>' % (nxt_cls, esc(nxt))) if nxt else "", notes=notes_html, shots=shots_html(slug), report=report)
+
+
+CSS = """
+  :root { --bg:#f8f7f3; --card:#ffffff; --ink:#15181d; --muted:#5f6673; --line:#e5e1d8;
+          --red:#c0263c; --amber:#8a5a00; --green:#126b46; --blue:#1a5cbf; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:17px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         -webkit-font-smoothing:antialiased; }
+  a { color:var(--blue); }
+  .topbar { position:sticky; top:0; z-index:30; background:rgba(248,247,243,.95);
+            backdrop-filter:saturate(1.4) blur(10px); border-bottom:1px solid var(--line); }
+  .topbar .in { max-width:1140px; margin:0 auto; padding:10px 22px; display:flex; gap:10px;
+                align-items:center; flex-wrap:wrap; }
+  .brand { font-weight:800; font-size:15px; letter-spacing:.01em; margin-right:auto; color:var(--ink); }
+  .brand span { color:var(--muted); font-weight:600; }
+  .jump { text-decoration:none; font-weight:700; font-size:14px; color:var(--ink);
+          background:#fff; border:1px solid var(--line); border-radius:99px; padding:6px 13px; }
+  .jump:hover { border-color:#b9b3a5; }
+  .jump.red { color:var(--red); border-color:#e8c3c9; background:#fff5f6; }
+  .wrap { max-width:1140px; margin:0 auto; padding:26px 22px 70px; }
+  .stamp-link { color:var(--ink); text-decoration:none; border-bottom:1px solid #d9cfb8; }
+  .jump.amber { color:#8a6d1f; border-color:#e8d5a8; background:#fffaf0; }
+  .jump.pickjump { color:var(--blue); border-color:#c3d7f4; background:#f3f8ff; }
+  .yeses { background:#fffdf6; border:1px solid #eadfc7; border-radius:14px;
+           padding:16px 20px 10px; margin:0 0 20px; }
+  .yeses h2 { font-size:19px; margin:0 0 2px; display:flex; gap:10px; align-items:baseline; }
+  .yeses .cnt { font-size:13px; font-weight:800; color:#8a6d1f; background:#fbeecd;
+                border-radius:99px; padding:3px 11px; }
+  .yeses .yes-lead { margin:2px 0 0; color:var(--muted); font-size:14px; }
+  .yeses ol { margin:10px 0 10px; padding-left:24px; }
+  .yeses li { margin:0 0 10px; line-height:1.5; font-size:15px; }
+  .yeses li a { color:var(--ink); font-weight:800; text-decoration:none; margin-right:10px;
+                border-bottom:1px solid #d9cfb8; }
+  .yeses li a:hover { border-bottom-color:var(--ink); }
+  .yeses .tw { overflow-x:auto; margin:12px 0 4px; }
+  table.yes { width:100%; border-collapse:collapse; font-size:14.5px; }
+  table.yes th { text-align:left; font-size:12px; letter-spacing:.04em; text-transform:uppercase;
+                 color:var(--muted); padding:8px 10px; border-bottom:1px solid #ecdfc6;
+                 white-space:nowrap; font-weight:800; }
+  table.yes td { padding:11px 10px; border-bottom:1px solid #f1e9d8; vertical-align:top; }
+  table.yes tr:last-child td { border-bottom:none; }
+  table.yes td.n { color:var(--muted); font-weight:800; width:26px; }
+  table.yes td.ap a { color:var(--ink); font-weight:800; text-decoration:none;
+                      border-bottom:1px solid #d9cfb8; white-space:nowrap; }
+  table.yes td.job { max-width:420px; }
+  table.yes .why { display:block; color:var(--muted); font-size:13px; margin-top:4px; }
+  .badge { font-size:12px; font-weight:800; border-radius:99px; padding:3px 10px; white-space:nowrap; }
+  .badge.clear { background:#e8f6ee; color:#17724a; }
+  .badge.gray { background:#f0ebf9; color:#573d8b; }
+  td.pick b { font-weight:800; }
+  td.ans { white-space:nowrap; }
+  td.ans button { font:inherit; font-size:13px; font-weight:800; border-radius:8px; padding:6px 12px;
+                  cursor:pointer; border:1px solid #d9cfb8; background:#fff; color:var(--ink);
+                  margin:0 6px 4px 0; }
+  td.ans button.y { border-color:#9ed3b4; background:#f3fbf6; color:#17724a; }
+  td.ans button:disabled { opacity:.45; cursor:default; }
+  td.ans .saved { font-size:13px; font-weight:800; color:#17724a; }
+  td.ans .saved.hold { color:#8a6d1f; }
+  td.ans .saved.fail { color:#b00020; }
+  td.ans .rebtn button { margin-left:6px; }
+  .downbar { background:#ffe8e8; border:2px solid #b00020; color:#7a0012; font-weight:800;
+             padding:10px 14px; border-radius:10px; margin:0 0 14px; }
+  .yes-foot { color:var(--muted); font-size:13px; margin:6px 0 8px; }
+  .hero { display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap; margin-bottom:6px; }
+  h1 { font-size:34px; line-height:1.1; letter-spacing:-.022em; margin:0; font-weight:800; }
+  .lead { color:var(--muted); font-size:16px; margin:8px 0 0; max-width:74ch; }
+  .stamp { color:var(--muted); font-size:14px; margin:10px 0 0; }
+  .stamp b { color:var(--ink); }
+  .bar { height:5px; border-radius:99px; margin:18px 0 8px;
+         background:linear-gradient(90deg,#2ee6a8,#22d3ee 16%,#ffd447 34%,#ff9e3d 48%,#ff3d6e 62%,#ff3d7f 76%,#c22bff); }
+  .filter { display:flex; gap:8px; margin:14px 0 22px; flex-wrap:wrap; align-items:center; }
+  .filter button { font:inherit; font-size:14.5px; font-weight:700; cursor:pointer; border-radius:99px;
+                   padding:8px 16px; border:1px solid var(--line); background:#fff; color:var(--ink); }
+  .filter button[aria-pressed="true"] { background:var(--ink); color:#fff; border-color:var(--ink); }
+  .filter .n { color:var(--muted); font-weight:600; font-size:14px; margin-left:6px; }
+  .app { background:var(--card); border-radius:20px; padding:26px 28px 22px; margin:0 0 26px;
+         box-shadow:0 1px 2px rgba(20,24,30,.05), 0 12px 28px -18px rgba(20,24,30,.28);
+         scroll-margin-top:70px; }
+  .app.red { box-shadow:0 1px 2px rgba(20,24,30,.05), 0 14px 30px -18px rgba(192,38,60,.35); }
+  .apphead { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  .icon { width:62px; height:62px; border-radius:15px; background:#f0eee8; flex:0 0 auto; }
+  .titles { flex:1 1 240px; }
+  .titles h2 { font-size:27px; margin:0; font-weight:800; letter-spacing:-.015em; }
+  .pkg { margin:3px 0 0; color:var(--muted); font-size:14px; }
+  .verdict { font-weight:800; font-size:15px; border-radius:99px; padding:8px 16px; white-space:nowrap; }
+  .verdict.red { color:var(--red); background:#fdeef0; }
+  .verdict.green { color:var(--green); background:#eaf7f0; }
+  .facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(228px,1fr)); gap:12px; margin:20px 0 0; }
+  .tile { background:#faf9f6; border-radius:14px; padding:13px 15px; min-height:96px; }
+  .tile.red { background:#fdf2f3; }
+  .tile .tl { font-size:11.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); font-weight:800; }
+  .tile .tv { font-size:17px; font-weight:800; margin:4px 0 3px; line-height:1.25; }
+  .tile span { display:block; font-size:13.5px; color:var(--muted); line-height:1.4; }
+  .tile.tile .tv .m, .m { color:var(--muted); font-weight:600; }
+  .tile span .m, .tile span b { display:inline; }
+  .twocol { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:20px 0 0; }
+  .block { border-radius:14px; padding:15px 17px; }
+  .block.missing { background:#fdf2f3; }
+  .block.waiting { background:#fdf8ea; }
+  .block h3 { margin:0 0 10px; font-size:13px; letter-spacing:.09em; text-transform:uppercase; font-weight:800; color:var(--muted); }
+  .block h3 .count { font-size:15px; color:var(--red); margin-left:2px; }
+  .block h3 .count.amber { color:var(--amber); }
+  .block ul, .block ol { margin:0; padding:0; list-style:none; }
+  .block li { display:flex; gap:10px; align-items:baseline; font-size:15.5px; font-weight:650;
+              padding:5px 0; line-height:1.4; }
+  .block li + li { border-top:1px solid rgba(20,24,30,.07); }
+  .block li .num { flex:0 0 auto; width:20px; height:20px; border-radius:50%; background:#f0dfae;
+                   color:#6b4700; font-size:12px; font-weight:800; display:grid; place-items:center; transform:translateY(2px); }
+  .dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; transform:translateY(-1px); }
+  .dot.dr { background:#d8415a; } .dot.dg { background:#1c9c68; }
+  .block li.clear { color:var(--green); font-weight:700; }
+  .src { display:inline-block; font-size:11px; letter-spacing:.07em; text-transform:uppercase; font-weight:800;
+         color:#8a2536; background:#f6d9de; border-radius:5px; padding:1px 6px; margin-right:8px;
+         transform:translateY(-1px); }
+  .next { margin:14px 0 0; border-radius:12px; padding:11px 15px; font-size:16px; font-weight:750; }
+  .next.amber { background:#fdf8ea; color:var(--amber); }
+  .next.blue { background:#eef4fd; color:var(--blue); }
+  .next.green { background:#eaf7f0; color:var(--green); }
+  .nc { display:block; margin:10px 0 0; font-size:13.5px; color:var(--muted); }
+  details { margin:16px 0 0; }
+  summary { cursor:pointer; font-weight:800; font-size:14px; letter-spacing:.02em; color:var(--ink);
+            padding:10px 0; list-style:none; }
+  summary::-webkit-details-marker { display:none; }
+  summary:before { content:"\\25b8"; display:inline-block; margin-right:9px; color:var(--muted);
+                   transition:transform .15s; }
+  details[open] > summary:before { transform:rotate(90deg); }
+  summary .hint { font-weight:600; color:var(--muted); margin-left:8px; font-size:13px; }
+  .shotsfold summary { border-top:1px solid var(--line); }
+  body.only-missing .shotsfold { display:none; }
+  body.only-missing article.app { padding-bottom:14px; }
+  .set + .set { margin-top:18px; }
+  .sethead { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; margin-bottom:9px; }
+  .sethead b { font-size:15.5px; }
+  .sethead em { font-style:normal; color:var(--muted); font-size:13.5px; }
+  .sethead span { margin-left:auto; color:var(--muted); font-size:13px; font-weight:700; }
+  .strip { display:grid; grid-template-columns:repeat(auto-fill,minmax(126px,1fr)); gap:10px; }
+  .strip.wide { grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); }
+  .strip.wide .shot img { height:auto; max-height:230px; }
+  .shot { text-decoration:none; color:var(--muted); font-size:11.5px; }
+  .shot img { width:100%; height:224px; object-fit:contain; background:#f3f1ec; border-radius:10px;
+              display:block; transition:transform .12s; }
+  .shot:hover img { transform:translateY(-2px); }
+  .shot span { display:block; margin-top:4px; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .files { margin:8px 0 0; }
+  .files summary { font-size:13px; font-weight:700; color:var(--blue); padding:4px 0; }
+  .files ul { margin:6px 0 0; padding-left:20px; columns:2; font-size:13px; }
+  .files li { margin:2px 0; }
+  .report { border-top:1px solid var(--line); margin-top:6px; }
+  .mdbody { background:#faf9f6; border-radius:14px; padding:6px 20px 14px; font-size:15.5px; }
+  .mdbody h3 { font-size:19px; margin:16px 0 6px; }
+  .mdbody h4 { font-size:16px; margin:18px 0 6px; letter-spacing:.02em; }
+  .mdbody h5 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:16px 0 5px; }
+  .mdbody p { margin:8px 0; }
+  .mdbody ul, .mdbody ol { margin:8px 0; padding-left:22px; }
+  .mdbody li { margin:4px 0; }
+  .mdbody hr { border:0; border-top:1px solid var(--line); margin:16px 0; }
+  .mdbody code { background:#efedE7; border-radius:5px; padding:1px 5px; font-size:13.5px; }
+  .mdbody table.md { border-collapse:collapse; width:100%; margin:12px 0; font-size:14.5px; background:#fff; border-radius:10px; overflow:hidden; }
+  .mdbody table.md th { text-align:left; font-size:11.5px; letter-spacing:.08em; text-transform:uppercase;
+                        color:var(--muted); padding:9px 11px; background:#f1efe9; }
+  .mdbody table.md td { padding:9px 11px; border-top:1px solid var(--line); vertical-align:top; }
+  .empty { color:var(--muted); background:#faf9f6; border-radius:12px; padding:14px 16px; font-size:15px; }
+  .foot { color:var(--muted); font-size:13.5px; margin-top:26px; line-height:1.7; }
+  .pagetab { display:inline-block; background:#fff; border:1px solid var(--line); color:var(--ink);
+             text-decoration:none; font-size:16px; font-weight:800; padding:12px 20px; border-radius:13px; margin:0 8px 8px 0; }
+  .pagetab:hover { border-color:#b9b3a5; }
+  .picks { background:#fff; border:1px solid var(--line); border-radius:14px;
+           padding:16px 20px 18px; margin:0 0 22px; }
+  .picks h2 { font-size:19px; margin:0 0 2px; display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; }
+  .picks .cnt { font-size:13px; font-weight:800; color:var(--blue); background:#e9f1fd;
+                border-radius:99px; padding:3px 11px; }
+  .picks .picks-lead { margin:2px 0 14px; color:var(--muted); font-size:14px; }
+  .pickapp + .pickapp { border-top:1px solid var(--line); margin-top:16px; padding-top:14px; }
+  .pickhead { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; margin-bottom:9px; }
+  .pickhead b { font-size:15.5px; }
+  .pickcount { font-size:12.5px; font-weight:800; color:var(--muted); background:#f2f0ea;
+               border-radius:99px; padding:2px 10px; }
+  .pickcount.some { color:#17724a; background:#e8f6ee; }
+  .pickcount.over { color:var(--red); background:#fdeef0; }
+  .picks-note { color:var(--muted); font-size:13px; margin-left:auto; }
+  .pickgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px; }
+  .pcard { position:relative; border-radius:12px; background:#faf9f6; border:2px solid transparent;
+          padding:6px; cursor:pointer; transition:transform .12s, border-color .12s, background .12s; }
+  .pcard:hover { transform:translateY(-2px); }
+  .pcard img { width:100%; height:196px; object-fit:contain; display:block; border-radius:8px;
+              background:#f1efe9; }
+  .pcard .tick { position:absolute; top:12px; left:12px; width:26px; height:26px; border-radius:50%;
+                background:#fff; border:1px solid #d9d3c6; color:#b9b3a5; font-size:13px; font-weight:800;
+                display:grid; place-items:center; }
+  .pcard .pmeta { display:flex; gap:5px; align-items:baseline; font-size:11.5px; margin:5px 1px 0; }
+  .pcard .pmeta b { font-weight:800; }
+  .pcard .pname { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pcard .open { margin-left:auto; color:var(--blue); text-decoration:none; font-weight:800; }
+  .pcard.on { border-color:#1c9c68; background:#f2fbf5; }
+  .pcard.on .tick { background:#1c9c68; border-color:#1c9c68; color:#fff; }
+  .pcard:focus-visible { outline:3px solid #9ec7ff; outline-offset:2px; }
+  @media (max-width:760px) {
+    body { font-size:16px; }
+    .wrap { padding:18px 14px 50px; }
+    .app { padding:20px 18px; border-radius:16px; }
+    .twocol { grid-template-columns:1fr; }
+    h1 { font-size:27px; }
+    .shot img { height:180px; }
+    .pickgrid { grid-template-columns:repeat(auto-fill,minmax(98px,1fr)); }
+    .pcard img { height:158px; }
+  }
+  @media print {
+    .topbar, .filter { display:none; }
+    .picks { display:none; }
+    body { background:#fff; }
+    .app { box-shadow:none; border:1px solid var(--line); page-break-inside:avoid; }
+    details { display:block; }
+    details > summary { display:none; }
+  }
+"""
+
+JS = """
+function receiverDown() {
+  if (document.getElementById('downbar')) return;
+  var d = document.createElement('div');
+  d.id = 'downbar'; d.className = 'downbar';
+  d.textContent = 'The tap receiver on this Mac is down — taps and picks will not save. Tell me in chat instead; I am restarting it.';
+  document.body.insertBefore(d, document.body.firstChild);
+}
+fetch('http://127.0.0.1:8791/decisions').then(function (r) { return r.json(); })
+  .then(function (list) {
+    var last = {};
+    (list || []).forEach(function (rec) {
+      if (rec && rec.n) last[((rec.app || '').trim().toLowerCase()) + '|' + (rec.step || '').trim()] = rec;
+    });
+    document.querySelectorAll('td.ans').forEach(function (cell) {
+      var rec = last[cell.dataset.app + '|' + cell.dataset.step];
+      if (!rec) return;
+      if (!cell.querySelector('button')) return;
+      var t = (rec.at || '').slice(11, 16);
+      cell.innerHTML = '<span class="saved' + (rec.answer === 'hold' ? ' hold' : '') + '">' +
+        (rec.answer === 'yes' ? '✅ yes' : '🟡 hold') + ' · ' + t + '</span>';
+    });
+  }).catch(receiverDown);
+
+document.querySelectorAll('td.ans').forEach(function (cell) {
+  cell.addEventListener('click', function (ev) {
+    var b = ev.target.closest('button');
+    if (!b) return;
+    var n = cell.dataset.n, v = b.dataset.v, row = b.closest('tr');
+    var app = cell.dataset.app || row.querySelector('td.ap a').textContent;
+    var job = cell.dataset.step;
+    if (!job) {
+      var jc = row.querySelector('td.job');
+      job = (jc.firstChild && jc.firstChild.textContent || jc.textContent).trim();
+    }
+    cell.querySelectorAll('button').forEach(function (x) { x.disabled = true; });
+    fetch('http://127.0.0.1:8791/decide', {
+      method: 'POST', headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ n: +n, app: app, step: job, answer: v })
+    }).then(function (r) {
+      if (!r.ok) throw new Error(r.status);
+      return r.text();
+    }).then(function () {
+      var t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      cell.innerHTML = '<span class="saved' + (v === 'hold' ? ' hold' : '') + '">' +
+                       (v === 'yes' ? '✅ yes' : '🟡 hold') + ' · ' + t + '</span>';
+      var f1 = document.getElementById('yesfoot');
+      if (f1) f1.innerHTML = '✅ Saved at ' + t + '. I read this at my next look — the tap card in my chat reaches me the moment you tap.';
+    }).catch(function () {
+      var q = '?n=' + encodeURIComponent(n) + '&answer=' + encodeURIComponent(v) +
+              '&app=' + encodeURIComponent(app) + '&step=' + encodeURIComponent(job);
+      var probe = new Image(), settled = false;
+      function notSaved() {
+        if (settled) return; settled = true;
+        cell.innerHTML = '<span class="saved fail">⚠ not saved</span>' +
+          '<span class="rebtn"><button data-v="yes">Yes</button><button data-v="hold">Hold</button></span>';
+        var f = document.getElementById('yesfoot');
+        if (f) f.textContent = 'The tap receiver on this Mac was down — I restarted it. Tap again and this saves.';
+      }
+      probe.onload = function () {
+        if (settled) return; settled = true;
+        var t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        cell.innerHTML = '<span class="saved' + (v === 'hold' ? ' hold' : '') + '">' +
+                         (v === 'yes' ? '✅ yes' : '🟡 hold') + ' · ' + t + '</span>';
+        var f2 = document.getElementById('yesfoot');
+        if (f2) f2.innerHTML = '✅ Saved at ' + t + '. I read this at my next look — the tap card in my chat reaches me the moment you tap.';
+      };
+      probe.onerror = notSaved;
+      probe.src = 'http://127.0.0.1:8791/decide' + q;
+      setTimeout(notSaved, 2500);
+    });
+  });
+});
+
+(function () {
+  var API = 'http://127.0.0.1:8791';
+  var state = {}, order = {};
+  function keyOf(c) { return c.dataset.app + '|' + c.dataset.file; }
+  function apply() {
+    var total = 0, per = {};
+    document.querySelectorAll('.pcard').forEach(function (c) {
+      var k = keyOf(c), on = !!state[k], app = c.dataset.app;
+      c.classList.toggle('on', on);
+      c.setAttribute('aria-checked', on ? 'true' : 'false');
+      var idx = (order[app] || []).indexOf(c.dataset.file);
+      c.querySelector('.tick').textContent = on ? String(idx + 1) : '\u2713';
+      if (on) { total += 1; per[app] = (per[app] || 0) + 1; }
+    });
+    document.querySelectorAll('.pickapp').forEach(function (g) {
+      var n = per[g.dataset.app] || 0, el = g.querySelector('.pickcount');
+      if (!el) return;
+      el.textContent = n + ' of 10 picked';
+      el.classList.toggle('over', n > 10);
+      el.classList.toggle('some', n > 0 && n <= 10);
+    });
+    var tt = document.getElementById('picktotal');
+    if (tt) tt.textContent = total + ' of ' + document.querySelectorAll('.pcard').length + ' ticked';
+  }
+  function save(app, file, on) {
+    var body = JSON.stringify({ n: 0, app: app, step: file, answer: on ? 'on' : 'off' });
+    fetch(API + '/decide', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: body })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); })
+      .catch(function () {
+        var probe = new Image();
+        probe.src = API + '/decide?n=0&app=' + encodeURIComponent(app) +
+          '&step=' + encodeURIComponent(file) + '&answer=' + (on ? 'on' : 'off');
+      });
+  }
+  function toggle(c) {
+    var app = c.dataset.app, file = c.dataset.file, k = app + '|' + file;
+    var on = !state[k];
+    if (on) { state[k] = true; (order[app] = order[app] || []).push(file); }
+    else {
+      delete state[k];
+      order[app] = (order[app] || []).filter(function (f) { return f !== file; });
+    }
+    apply();
+    save(app, file, on);
+  }
+  document.querySelectorAll('.pcard').forEach(function (c) {
+    c.addEventListener('click', function (ev) {
+      if (ev.target.closest('a')) return;
+      toggle(c);
+    });
+    c.addEventListener('keydown', function (ev) {
+      if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); toggle(c); }
+    });
+  });
+  fetch(API + '/decisions').then(function (r) { return r.json(); }).then(function (list) {
+    (list || []).forEach(function (rec) {
+      if (!rec || (rec.answer !== 'on' && rec.answer !== 'off')) return;
+      var app = rec.app, file = rec.step, k = app + '|' + file;
+      if (rec.answer === 'on') {
+        if (!state[k]) { state[k] = true; (order[app] = order[app] || []).push(file); }
+      } else {
+        delete state[k];
+        order[app] = (order[app] || []).filter(function (f) { return f !== file; });
+      }
+    });
+    apply();
+  }).catch(receiverDown);
+})();
+
+document.querySelectorAll('.filter button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var mode = b.dataset.mode;
+    document.querySelectorAll('.filter button').forEach(function (x) { x.setAttribute('aria-pressed', 'false'); });
+    b.setAttribute('aria-pressed', 'true');
+    document.querySelectorAll('.app').forEach(function (c) {
+      var miss = parseInt(c.dataset.missing || '0', 10);
+      c.style.display = (mode === 'missing' && miss === 0) ? 'none' : '';
+      document.body.classList.toggle('only-missing', mode === 'missing');
+    });
+  });
+});
+"""
+
+
+def main():
+    state = load_json(STATE, {})
+    apps = state.get("apps") or []
+    pending = (load_json(PENDING, {}) or {}).get("apps") or {}
+    when = state.get("generatedAt") or ""
+    try:
+        when = datetime.fromisoformat(when.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        pass
+
+    cards = []
+    total_missing = total_wait = 0
+    for a in apps:
+        slug = a.get("slug")
+        wait = pending.get(slug) or []
+        card = app_card(a, wait)
+        cards.append(card)
+    # counts for the header + jump bar (recomputed cheaply from the same JSON)
+    jumps = []
+    for a in apps:
+        n = len(missing_of(a))
+        total_missing += n
+        total_wait += len(pending.get(a.get("slug")) or [])
+        jumps.append('<a class="jump%s" href="#%s">%s%s</a>' % (
+            " red" if n else "", esc(a.get("slug")),
+            esc(a.get("name") or a.get("slug")), (' · %d' % n) if n else " · ok"))
+        jumps[-1] = jumps[-1]
+
+    answers = {}
+    try:
+        with open(DECISIONS, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("n"):
+                    key = ((rec.get("app") or "").strip().lower(), (rec.get("step") or "").strip())
+                    answers[key] = rec
+    except OSError:
+        pass
+
+    rows = []
+    n_yes = 0
+    for a in apps:
+        slug = (a.get("slug") or "")
+        for st in norm_steps(pending.get(a.get("slug"))):
+            n_yes += 1
+            kind = KIND_LABEL.get(st["kind"], "Clear")
+            pick = "Go" if st["pick"] == "yes" else ("Hold" if st["pick"] == "hold" else st["pick"])
+            why = ('<span class="why">%s</span>' % esc(st["why"])) if st["why"] else ""
+            rows.append(
+                '<tr><td class="n">%d</td>'
+                '<td class="ap"><a href="#%s">%s</a></td>'
+                '<td class="job">%s%s</td>'
+                '<td class="kind"><span class="badge %s">%s</span></td>'
+                '<td class="pick"><b>%s</b></td>'
+                '<td class="ans" data-n="%d" data-app="%s" data-step="%s">%s</td></tr>'
+                % (n_yes, esc(slug), esc(a.get("name") or a.get("slug")),
+                   esc(st["step"]), why, esc(st["kind"]), kind, esc(pick), n_yes,
+                   esc(slug.lower()), esc(st["step"]),
+                   answered(answers.get((slug.lower(), st["step"].strip())))))
+    yes_block = ""
+    done_rows = []
+    live_keys = set()
+    for a in apps:
+        for st in norm_steps(pending.get(a.get("slug"))):
+            live_keys.add(((a.get("slug") or "").lower(), st["step"].strip()))
+    for key, rec in answers.items():
+        if key in live_keys:
+            continue
+        when = esc((rec.get("at") or "")[11:16])
+        mark = "✅ yes" if (rec.get("answer") or "").lower() == "yes" else "🟡 hold"
+        done_rows.append((rec.get("at") or "", '<li><b>%s</b> — %s<span class="when">%s · %s</span></li>'
+                          % (esc((rec.get("app") or "").strip()), esc((rec.get("step") or "")[:120]), mark, when)))
+    done_rows.sort(reverse=True)
+    done_html = ""
+    if done_rows:
+        done_html = ('<div class="done"><b>Done from your taps</b><ul>%s</ul></div>'
+                     % "".join(r[1] for r in done_rows[:12]))
+    if rows:
+        yes_block = (
+            '<section class="yeses" id="yeses"><h2>Your yeses '
+            '<span class="cnt">%d steps</span></h2>'
+            '<p class="yes-lead">Grey means a real choice; Clear means the fact decides it. '
+            'My pick sits in its own column — answer with the two buttons.</p>'
+            '<div class="tw"><table class="yes"><thead><tr><th>#</th><th>App</th>'
+            '<th>What waits</th><th>Kind</th><th>My pick</th><th>Your answer</th></tr></thead>'
+            '<tbody>%s</tbody></table></div>%s'
+            '<p class="yes-foot" id="yesfoot">A tap here saves on this Mac, and I pick it up at my next look. The tap card in my chat reaches me the moment you tap.</p>'
+            '</section>' % (len(rows), "".join(rows), done_html))
+        jumps.append('<a class="jump amber" href="#yeses">Your yeses · %d</a>' % len(rows))
+
+    picks_block = picks_html(apps)
+    n_shots = sum(len(pick_files(a.get("slug") or "")) for a in apps)
+    if picks_block:
+        jumps.append('<a class="jump pickjump" href="#picks">Pick your 10 · %d</a>' % n_shots)
+
+    page = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Apps — owner evidence</title>
+<style>%(css)s</style></head>
+<body>
+<div class="topbar"><div class="in">
+  <div class="brand">Owner evidence <span>— what each Bot proved</span></div>
+  %(jumps)s
+</div></div>
+
+<div class="wrap">
+  <h1>What each Bot proved</h1>
+  <p class="lead">Four apps, four owner Bots. Every line here comes from the stores’ own API,
+     from a file in that app’s evidence folder, or from its own report — nothing is typed by hand.</p>
+  <p class="stamp">Stores read <b>%(when)s</b> · <b>%(nmiss)d missing</b> across %(napps)d apps ·
+     <a class="stamp-link" href="#picks"><b>%(nshots)d candidate shots</b> to tick ↓</a> ·
+     <a class="stamp-link" href="#yeses"><b>%(nwait)d steps</b> waiting on your yes ↓</a></p>
+  <div class="bar"></div>
+  %(yes_block)s
+  %(picks)s
+
+  <div class="filter">
+    <button data-mode="all" aria-pressed="true">Everything<span class="n">%(napps)d apps</span></button>
+    <button data-mode="missing" aria-pressed="false">Only what is missing<span class="n">%(nmiss)d</span></button>
+    <span class="n">Screenshots open full size · the long report is folded under each app</span>
+  </div>
+
+  %(cards)s
+
+  <p class="foot">Sources: <code>%(state)s</code> (Apple App Store Connect + Google Play + Xcode Cloud + git),
+     <code>%(pending)s</code> (steps waiting on Ammaniel), and each app’s
+     <code>%(evid)s/&lt;app&gt;/STATUS.md</code> with its <code>shots/</code> folder.<br>
+     Regenerate with <code>~/.dsh/bin/apps-evidence</code>.</p>
+
+  <div style="margin-top:22px">
+    <a class="pagetab" href="file://%(apps_page)s">← Apps status: what is missing</a>
+    <a class="pagetab" href="file://%(proj_page)s">Projects status →</a>
+  </div>
+</div>
+<script>%(js)s</script>
+</body></html>
+""" % dict(css=CSS, js=JS, jumps="".join(jumps), cards="\n".join(cards), when=esc(when),
+           nmiss=total_missing, nwait=total_wait, napps=len(apps), state=STATE, pending=PENDING,
+           evid=EVID, apps_page=APPS_PAGE, proj_page=PROJ_PAGE, yes_block=yes_block,
+           picks=picks_block, nshots=n_shots)
+
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    tmp = OUT + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(page)
+    os.replace(tmp, OUT)
+    print("wrote %s (%d apps, %d missing, %d waiting)" % (OUT, len(apps), total_missing, total_wait))
+
+
+if __name__ == "__main__":
+    main()

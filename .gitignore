@@ -19,3 +19,17 @@ background/
 
 # macOS junk
 .DS_Store
+
+# Extra guard (2026-10-22)
+.credentials*
+*.credentials*
+bot/
+cache/
+state/
+logs/
+*.bak-*
+*.before-*
+*.imported
+plugin-patch-backup-*/
+.dsh-any-background-data/
+2-HARDCOVER-COVER-360x265.pdf

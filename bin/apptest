@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""apptest — one command that runs every app's own test suite.
+
+  apptest                 run all apps in the plan
+  apptest netbrew pixwee  run only the named apps
+  apptest --list          show the plan
+  apptest --dry           show what would run, run nothing
+
+Plan lives in ~/.dsh/apptests/plans.json. Each app entry:
+  name, dir, cmd, [prep], [serve {cmd,url,wait}], [timeout], [report]
+
+Every run writes its logs and a summary to
+/Users/nakfaai/output/apptest/<stamp>/ (outside .dsh so links open).
+Exit code 0 when every app passed, 1 otherwise.
+"""
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+from urllib.parse import urlparse
+
+PLANS = os.path.expanduser("~/.dsh/apptests/plans.json")
+ENV = dict(os.environ, CI="1")  # CI=1 => Playwright starts its own server, never reuses a leftover one
+OUTROOT = "/Users/nakfaai/output/apptest"
+
+
+def load():
+    with open(PLANS) as f:
+        return json.load(f)
+
+
+def port_open(url, timeout=1.0):
+    u = urlparse(url)
+    host = u.hostname or "127.0.0.1"
+    port = u.port or (443 if u.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def free_ports(ports):
+    """Stop a leftover dev server on one of our ports; it serves a stale build."""
+    for port in ports or []:
+        try:
+            pids = subprocess.run(["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"],
+                                  stdout=subprocess.PIPE, text=True).stdout.split()
+        except OSError:
+            pids = []
+        for pid in pids:
+            print(f"  freeing port {port} (leftover server pid {pid})")
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+        if pids:
+            time.sleep(2)
+
+
+def wait_port(url, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if port_open(url):
+            return True
+        time.sleep(1)
+    return False
+
+
+def counts(text):
+    p = f = 0
+    m = re.findall(r"(\d+) passed", text)
+    if m:
+        p = int(m[-1])
+    m = re.findall(r"(\d+) failed", text)
+    if m:
+        f = int(m[-1])
+    return p, f
+
+
+def run_one(plan, stamp, dry=False):
+    app = plan.get("app") or plan["name"].lower()
+    name = plan["name"]
+    outdir = os.path.join(OUTROOT, stamp)
+    os.makedirs(outdir, exist_ok=True)
+    logpath = os.path.join(outdir, app + ".log")
+    t0 = time.time()
+    lines = []
+    serve = None
+    ok = False
+    detail = ""
+
+    if dry:
+        print(f"  {app}: dir={plan['dir']} cmd={plan['cmd']}")
+        return True, "dry", 0.0, ""
+
+    try:
+        free_ports(plan.get("ports"))
+
+        if plan.get("prep"):
+            lines.append("$ prep " + plan["prep"])
+            r = subprocess.run(
+                plan["prep"], shell=True, cwd=plan["dir"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=plan.get("prepTimeout", 600), env=ENV,
+            )
+            lines.append(r.stdout[-3000:])
+            if r.returncode != 0:
+                detail = "prep failed"
+                raise RuntimeError(detail)
+
+        sv = plan.get("serve")
+        if sv:
+            lines.append("$ serve " + sv["cmd"])
+            serve = subprocess.Popen(
+                sv["cmd"], shell=True, cwd=sv.get("cwd", plan["dir"]),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True, env=ENV,
+            )
+            if not wait_port(sv["url"], sv.get("wait", 90)):
+                detail = f"server never answered on {sv['url']}"
+                raise RuntimeError(detail)
+            time.sleep(2)
+
+        lines.append("$ " + plan["cmd"])
+        r = subprocess.run(
+            plan["cmd"], shell=True, cwd=plan["dir"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=plan.get("timeout", 1200), env=ENV,
+        )
+        lines.append(r.stdout[-8000:])
+        with open(logpath + ".full", "w") as ff:
+            ff.write(r.stdout)
+        passed, failed = counts(r.stdout)
+        ok = r.returncode == 0
+        detail = f"{passed} passed, {failed} failed" if (passed or failed) else (
+            "exit 0" if ok else f"exit {r.returncode}")
+    except subprocess.TimeoutExpired:
+        detail = "timed out"
+        lines.append("TIMEOUT")
+    except Exception as e:  # noqa: BLE001
+        detail = detail or str(e)
+        lines.append("ERROR " + str(e))
+    finally:
+        if serve and serve.poll() is None:
+            try:
+                os.killpg(os.getpgid(serve.pid), signal.SIGTERM)
+            except OSError:
+                pass
+
+    dur = time.time() - t0
+    with open(logpath, "w") as f:
+        f.write("\n".join(lines))
+    return ok, detail, dur, logpath
+
+
+def main():
+    argv = sys.argv[1:]
+    dry = "--dry" in argv
+    argv = [a for a in argv if a != "--dry"]
+    data = load()
+    apps = data["apps"]
+    if "--list" in argv or not apps:
+        for a in apps:
+            print(f"{a.get('app', a['name'].lower()):10s} {a['name']:12s} {a['dir']}")
+        return 0
+    want = argv or None
+    plans = [a for a in apps if want is None or a.get("app", a["name"].lower()) in want]
+    if not plans:
+        print("no such app in the plan; try apptest --list")
+        return 2
+
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+    print(f"apptest {stamp} — {len(plans)} app(s)")
+    results = []
+    for p in plans:
+        ok, detail, dur, logpath = run_one(p, stamp, dry)
+        app = p.get("app", p["name"].lower())
+        mark = "PASS" if ok else "FAIL"
+        print(f"{mark}  {app:10s} {dur:6.1f}s  {detail}")
+        results.append({"app": app, "name": p["name"], "ok": ok,
+                        "detail": detail, "seconds": round(dur, 1), "log": logpath})
+
+    if dry:
+        return 0
+    outdir = os.path.join(OUTROOT, stamp)
+    with open(os.path.join(outdir, "results.json"), "w") as f:
+        json.dump(results, f, indent=1)
+    with open(os.path.join(outdir, "summary.md"), "w") as f:
+        f.write(f"# apptest — {stamp}\n\n")
+        for r in results:
+            f.write(f"- {'PASS' if r['ok'] else 'FAIL'} **{r['name']}** — "
+                    f"{r['detail']} ({r['seconds']}s)\n")
+    print("summary: " + os.path.join(outdir, "summary.md"))
+    return 0 if all(r["ok"] for r in results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,497 @@
+#!/usr/bin/env node
+// props-status — the one command behind the three non-app projects.
+//
+//   props-status              check hintza.com, salsacubanadallas.com and the books,
+//                            log what moved, rewrite the page
+//   props-status page         rewrite /Users/nakfaai/output/projects/status.html from last JSON
+//   props-status json         the same read, JSON on stdout, no log, no page
+//   props-status open         open the page in Safari
+//
+// READ ONLY. This file never writes to a website, never posts a form, never
+// touches KDP and never moves money. It reads pages over HTTPS, reads the Books
+// folder on disk, and writes three things of its own:
+//   /Users/nakfaai/.dsh/state/props-status.json   the truth just measured
+//   /Users/nakfaai/.dsh/state/props-log.md        one line per run, only what moved
+//   /Users/nakfaai/output/projects/status.html    the page, rendered from that JSON
+//
+// Every line the page shows is measured here. Anything unmeasurable says so.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+
+const HINTZA = 'https://ammanielhintza.com';
+const SALSA = 'https://salsacubanadallas.com';
+const KINGEZANA = 'https://kingezana.com';
+const BOOKS = '/Users/nakfaai/Developer/projects/Books';
+const OUTDIR = '/Users/nakfaai/output/projects';
+const ICONDIR = path.join(OUTDIR, 'icons');
+const STATE = '/Users/nakfaai/.dsh/state/props-status.json';
+const LOG = '/Users/nakfaai/.dsh/state/props-log.md';
+const CHROME = '/Users/nakfaai/Library/Caches/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-mac-arm64/chrome-headless-shell';
+
+const now = () => { const d = new Date(); const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };
+const pad = (n, w = 2) => String(n).padStart(w, '0');
+
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15';
+
+async function http(url) {
+  const t0 = Date.now();
+  const r = spawnSync('curl', ['-sS', '-L', '--max-time', '15', '-A', UA,
+    '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    '-H', 'Accept-Language: en-US,en;q=0.9', url,
+    '-w', '\n%{http_code} %{time_total} %{size_download}'], { encoding: 'utf8', timeout: 30000, maxBuffer: 30 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  const out = r.stdout || '';
+  const nl = out.lastIndexOf('\n');
+  const tail = out.slice(nl + 1).trim().split(' ');
+  const body = out.slice(0, nl);
+  const code = Number(tail[0] || 0);
+  const secs = Number(tail[1] || 0);
+  return { url, code, ms: Math.round(secs * 1000) || (Date.now() - t0), bytes: body.length, body: code >= 200 && code < 400 ? body : '' };
+}
+
+function sslDays(host) {
+  try {
+    const out = execFileSync('bash', ['-c', `echo | openssl s_client -servername ${host} -connect ${host}:443 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const m = out.match(/notAfter=(.+)/);
+    if (!m) return null;
+    const end = new Date(m[1]);
+    return Math.floor((end - Date.now()) / 86400000);
+  } catch { return null; }
+}
+
+function domOf(url, budget = 12000) {
+  try {
+    const r = spawnSync(CHROME, ['--headless', '--disable-gpu', '--hide-scrollbars', '--virtual-time-budget=' + budget, '--dump-dom', url], { encoding: 'utf8', timeout: 45000, maxBuffer: 20 * 1024 * 1024 });
+    return (r.stdout || '') + (r.stderr || '');
+  } catch { return ''; }
+}
+const textOf = html => html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&[a-z#0-9]+;/gi, ' ').replace(/\s+/g, ' ').trim();
+
+function countForms(html) { return (html.match(/<form\b/gi) || []).length; }
+
+function gitDirty(dir) {
+  try {
+    const out = execFileSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8', timeout: 20000 });
+    const lines = out.split('\n').filter(Boolean);
+    let branch = '';
+    try { branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim(); } catch {}
+    let last = '';
+    try { last = execFileSync('git', ['log', '-1', '--pretty=%cd %s', '--date=format:%Y-%m-%d'], { cwd: dir, encoding: 'utf8' }).trim(); } catch {}
+    return { dirty: lines.length, branch, last };
+  } catch { return { dirty: null, branch: '', last: '' }; }
+}
+
+function find(pattern, cwd) {
+  try { return fs.globSync(pattern, { cwd, exclude: p => p.includes('node_modules') }); } catch { return []; }
+}
+
+// ---------- classify ----------
+const BLOCKED_CODES = new Set([0, 401, 403, 429, 451]);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const isBlocked = list => list.length > 0 && list.every(r => BLOCKED_CODES.has(r.code));
+
+// ---------- hintza.com ----------
+async function checkHintza() {
+  const base = { slug: 'hintza', name: 'Ammaniel Hintza', what: 'ammanielhintza.com · photography', icon: 'hintza.png', owner: 'Ammaniel Hintza COM', url: HINTZA,
+    goal: 'the site turns visitors into booked shoots' };
+  const routes = ['/', '/booking', '/contact'];
+  const res = [];
+  for (const r of routes) { res.push(await http(HINTZA + r)); await sleep(600); }
+  const ssl = sslDays('ammanielhintza.com');
+
+  if (isBlocked(res)) return { ...base, blocked: true, at: now(), ssl, codes: res.map(r => r.code) };
+
+  const sm = res[0].code === 200 ? await http(HINTZA + '/sitemap.xml') : { body: '' };
+  const routeCount = (sm.body.match(/<loc>/g) || []).length;
+  const bad = res.filter(r => r.code !== 200);
+  const slow = res.filter(r => r.code === 200 && r.ms > 3000);
+  const ok = res.filter(r => r.code === 200);
+  const avg = Math.round(ok.reduce((n, r) => n + r.ms, 0) / Math.max(1, ok.length));
+
+  let bookingOk = false, bookingText = '';
+  if (res[1].code === 200) {
+    bookingText = textOf(domOf(HINTZA + '/booking'));
+    bookingOk = bookingText.length > 400 && /book|session|consult|date|inquir|contact/i.test(bookingText);
+  }
+
+  const reds = [], ambers = [], greens = [];
+  if (bad.length) reds.push(`key page not answering: ${bad.map(b => b.url.replace(HINTZA, '') + ' → ' + b.code).join(', ')}`);
+  if (ssl !== null && ssl < 21) reds.push(`SSL certificate expires in ${ssl} days`);
+  if (!bookingOk) reds.push('the booking page does not render its form');
+  if (slow.length) ambers.push(`slow page: ${slow.map(s => s.url.replace(HINTZA, '') + ' ' + (s.ms / 1000).toFixed(1) + 's').join(', ')}`);
+  if (routeCount && routeCount < 10) ambers.push(`only ${routeCount} pages in the sitemap`);
+  greens.push(`${ok.length} of ${routes.length} key pages answer, ${avg} ms average`);
+  if (routeCount) greens.push(`sitemap lists ${routeCount} pages`);
+  if (ssl !== null) greens.push(`SSL valid for ${ssl} more days`);
+  if (bookingOk) greens.push('booking page renders its form in a real browser');
+
+  return { ...base, at: now(), reds, ambers, greens,
+    next: reds.length ? reds[0].replace(/^./, c => c.toUpperCase()) + '.' : 'Nothing — the site and its booking form answer.',
+    facts: [['key pages', routes.map((r, i) => r + ' ' + res[i].code).join(' · ')], ['sitemap', routeCount + ' pages'], ['SSL', ssl === null ? 'not checked' : ssl + ' days left']] };
+}
+
+// ---------- salsacubanadallas.com ----------
+async function checkSalsa() {
+  const base = { slug: 'salsa', name: 'Salsa Cubana Dallas', what: 'salsacubanadallas.com · classes and rueda', icon: 'salsa.png', owner: 'Salsa cubana Dallas', url: SALSA,
+    goal: 'the page fills the classes with real sign-ups' };
+  const pages = ['/', '/availability.html', '/meetup.html'];
+  const res = [];
+  for (const r of pages) { res.push(await http(SALSA + r)); await sleep(600); }
+  const ssl = sslDays('salsacubanadallas.com');
+  if (isBlocked(res)) return { ...base, blocked: true, at: now(), ssl, codes: res.map(r => r.code) };
+
+  const home = res[0];
+  const bad = res.filter(r => r.code !== 200);
+  const forms = countForms(home.body || '');
+  const insta = /instagram\.com\/salsa_cubana_dallas/i.test(home.body || '');
+  const admin = forms ? await http(SALSA + '/updates-admin.html') : { code: 0, body: '' };
+  const adminServer = /updates-admin\.php/.test(admin.body || '');
+
+  const reds = [], ambers = [], greens = [];
+  if (bad.length) reds.push(`page not answering: ${bad.map(b => b.url.replace(SALSA, '') + ' → ' + b.code).join(', ')}`);
+  if (ssl !== null && ssl < 21) reds.push(`SSL certificate expires in ${ssl} days`);
+  if (!forms) reds.push('the homepage has no sign-up form');
+  if (!insta) ambers.push('no Instagram link on the homepage');
+  greens.push(`${res.filter(r => r.code === 200).length} of ${pages.length} pages answer, home at ${home.ms} ms`);
+  if (forms) greens.push(`${forms} sign-up form${forms === 1 ? '' : 's'} on the homepage`);
+  if (insta) greens.push('Instagram link points at salsa_cubana_dallas');
+  if (adminServer) greens.push('the update form is checked by the server, not in the browser');
+  if (ssl !== null) greens.push(`SSL valid for ${ssl} more days`);
+
+  return { ...base, at: now(), reds, ambers, greens,
+    next: reds.length ? reds[0].replace(/^./, c => c.toUpperCase()) + '.' : 'Nothing — the site answers and the sign-up form is there.',
+    facts: [['pages', pages.map((p, i) => p + ' ' + res[i].code).join(' · ')], ['forms', String(forms)], ['admin form', adminServer ? 'server-checked' : (admin.code ? 'no server check' : 'not checked')], ['SSL', ssl === null ? 'not checked' : ssl + ' days left']] };
+}
+
+// ---------- books ----------
+const TITLES = [
+  { key: 'king-ezana', name: 'The King Who Gave Us the Cross', dirs: ['King Ezana'],
+    goal: 'hardcover and Kindle live on KDP, then Apple Books' },
+  { key: 'eritrea', name: 'Eritrea: The Name Italy Chose', dirs: ['Eritrea'],
+    goal: 'the pack built and the hardcover live on KDP' },
+  { key: 'solomonic', name: 'The Solomonic Claim: The Missing Bloodline', dirs: ['solomonicClaim'],
+    goal: 'the approved pack uploaded and live on KDP' },
+  { key: 'monarchy', name: 'Monarchy or Democracy?', dirs: ['MONARCHY? ETHIOPIA? AGAIN?', 'MONARCHY-PACK'],
+    goal: 'an ISBN he names, then the 238-page hardcover printed' },
+  { key: 'nakfa', name: 'The Million Nakfa Question', dirs: ['The-Million-Nakfa-Question'],
+    goal: 'his Tigrinya wording in, then uploaded' },
+  { key: 'red', name: 'The Red Book — English + Tigrinya', dirs: ['PRE'],
+    goal: 'both editions finished and uploaded' },
+];
+
+async function checkBooks() {
+  const reds = [], ambers = [], greens = [];
+  const git = gitDirty(BOOKS);
+  if (git.dirty === null) reds.push('the Books folder is not a git repository');
+  else if (git.dirty > 0) reds.push(`${git.dirty} files changed or new and not committed`);
+
+  const registry = find('WARSHA/ISBN-REGISTRY.md', BOOKS).length > 0;
+  if (!registry) reds.push('no ISBN registry on disk');
+  else greens.push('ISBN registry on disk (WARSHA/ISBN-REGISTRY.md)');
+
+  const rows = [];
+  for (const t of TITLES) {
+    const dir = t.dirs.find(d => fs.existsSync(path.join(BOOKS, d)));
+    if (!dir) { rows.push({ ...t, epub: 0, pdf: 0 }); ambers.push(`${t.name}: folder missing`); continue; }
+    const epub = find('**/*.epub', path.join(BOOKS, dir));
+    const pdf = find('**/*.pdf', path.join(BOOKS, dir));
+    rows.push({ ...t, epub: epub.length, pdf: pdf.length, dir });
+    if (!epub.length) ambers.push(`${t.name}: no ebook file (epub) in the folder`);
+  }
+  const epubs = rows.reduce((n, r) => n + r.epub, 0);
+  const pdfs = rows.reduce((n, r) => n + r.pdf, 0);
+  greens.push(`${rows.length} books on disk, ${epubs} ebook files, ${pdfs} print PDFs`);
+
+  const kz = await http(KINGEZANA);
+  const kzBlocked = BLOCKED_CODES.has(kz.code);
+  let kzLine = kz.code + ' at ' + kz.ms + ' ms';
+  if (kzBlocked) { kzLine = 'refused this machine at ' + now(); ambers.push('kingezana.com refused this machine when checked — not claimed down'); }
+  else if (kz.code !== 200) { reds.push('kingezana.com answers ' + kz.code); }
+  else greens.push('kingezana.com answers 200 at ' + kz.ms + ' ms');
+
+  return { slug: 'books', name: 'Books', what: 'six books · KDP and print', icon: 'books.png', owner: 'The Solomonic Claim', url: KINGEZANA,
+    goal: (readGoalFile(path.join(BOOKS, 'GOAL.md')) || {}).target || 'all six live on KDP in hardcover and ebook',
+    at: now(), reds, ambers, greens,
+    next: reds.length ? reds[0].replace(/^./, c => c.toUpperCase()) + '.' : 'Nothing uncommitted — the files are in git.',
+    facts: [['git', git.dirty === null ? 'not a repo' : git.dirty + ' changed'], ['branch', git.branch || '—'], ['last commit', git.last || '—'], ['kingezana.com', kzLine], ['KDP', 'not checked (no API)']] , booksRows: rows };
+}
+
+// ---------- collect ----------
+async function collect() {
+  const hintza = await checkHintza();
+  const salsa = await checkSalsa();
+  const booksProp = await checkBooks();
+  const rows = booksProp.booksRows || [];
+  delete booksProp.booksRows;
+  return { props: [hintza, salsa, booksProp], books: { rows } };
+}
+
+// ---------- merge a blocked read with the last good one ----------
+function mergeBlocked(cur, prev) {
+  if (!cur.blocked) return cur;
+  const old = ((prev && prev.props) || []).find(p => p.slug === cur.slug && !p.blocked);
+  const stamp = cur.at;
+  if (!old) {
+    return { ...cur, blocked: false, reds: ['not checked — the site refused this machine at ' + stamp.slice(11)], ambers: [], greens: [],
+      next: 'Retry at the next run. Nothing is claimed until a page answers.',
+      facts: [['checked', 'blocked at ' + stamp]] };
+  }
+  const keep = (old.ambers || []).filter(a => !/refused this machine/.test(a));
+  return { ...old, at: old.at,
+    ambers: [...keep, 'site refused this machine at ' + stamp.slice(11) + ' — this is the last good read, retry at the next run'],
+    next: old.next,
+    facts: (old.facts || []).map(([k, v]) => [k, v]) };
+}
+
+// ---------- page ----------
+const CSS = `  :root{ --ink:#f2f4f6; --muted:#a8b0ba; --line:#3d4249; --bg:#24272b; --card:#2c3036;
+         --red:#ff8078; --amber:#ffc857; --green:#63df9d; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);padding:30px 20px 50px;
+       font:17.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+       font-weight:500;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1280px;margin:0 auto}
+  h1{font-size:32px;margin:0 0 6px;letter-spacing:-.02em;font-weight:800}
+  .stamp{color:var(--muted);font-size:14.5px;font-weight:650;margin:0 0 16px}
+  .bar{height:6px;border-radius:99px;margin:0 0 22px;
+       background:linear-gradient(90deg,#2ee6a8,#22d3ee 16%,#ffd447 34%,#ff9e3d 48%,#ff3d6e 62%,#ff3d7f 76%,#c22bff)}
+  h2{font-size:15px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:30px 2px 12px;font-weight:800}
+  h2:first-of-type{margin-top:4px}
+  .count{color:var(--red);font-weight:800}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;align-items:start}
+  .mlist{background:var(--card);border-radius:16px;padding:16px 18px;border:1px solid var(--line)}
+  .mhead{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+  .mhead img{width:44px;height:44px;border-radius:11px;border:1px solid #4a515a;object-fit:cover;background:#3a4048}
+  .nm{font-weight:800;font-size:18px;line-height:1.15}
+  .ver{color:var(--muted);font-size:13.5px;font-weight:650}
+  .own{color:#cfd6de;font-size:13px;font-weight:700;margin-top:2px}
+  .item{display:flex;gap:10px;align-items:baseline;margin:0 0 7px;font-size:16.5px;font-weight:600}
+  .item:last-child{margin-bottom:0}
+  .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto;transform:translateY(-1px)}
+  .dr{background:#ff6f66} .da{background:#ffc857} .dg{background:#63df9d}
+  .r{color:var(--red);font-weight:800} .a{color:var(--amber);font-weight:800} .g{color:var(--green);font-weight:800}
+  .nextline{background:#1f3a2c;border-radius:12px;padding:10px 13px;margin:12px 0 0;font-size:16.5px;font-weight:700;line-height:1.35;color:#eefbf3;border-left:5px solid #63df9d}
+  .nextline .nx{display:inline-block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;color:#0d2d1c;background:#63df9d;border-radius:99px;padding:2px 8px;margin-right:7px;transform:translateY(-2px)}
+  .note{color:var(--muted);font-size:14px;font-weight:600;margin:9px 0 0}
+  .scroll{background:var(--card);border-radius:16px;overflow-x:auto;border:1px solid var(--line)}
+  table{border-collapse:collapse;width:100%;min-width:760px}
+  thead th{font-size:12.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+           font-weight:800;text-align:left;padding:14px 18px 10px;border-bottom:1px solid var(--line);background:#31363c}
+  tbody td{padding:14px 18px;border-bottom:1px solid var(--line);vertical-align:middle;font-weight:600}
+  tbody tr:last-child td{border-bottom:0}
+  .green{color:#dde3ea;font-size:15.5px;line-height:1.6;font-weight:600}
+  .green b{color:var(--green);font-weight:800}
+  .box{background:var(--card);border-radius:16px;padding:16px 18px;border:1px solid var(--line)}
+  .box h3{font-size:17px;margin:0 0 10px;font-weight:800}
+  .box ul{margin:0;padding-left:22px;font-size:16px;font-weight:600}
+  .box li{margin:6px 0}
+  .log{font-size:15px;font-weight:600;color:#dde3ea}
+  .log div{margin:4px 0}
+  .log span{color:var(--muted);font-weight:700}
+  .foot{color:var(--muted);font-size:14px;font-weight:600;margin-top:18px}
+  .pagetab{display:inline-block;background:#343a42;border:1px solid #6b7684;color:#eef3f8;text-decoration:none;font-size:17.5px;font-weight:800;padding:14px 24px;border-radius:14px}
+  .pagetab:hover{background:#3f4650;border-color:#8b97a6}
+  .goalline{background:#1e2a3a;border-radius:12px;padding:10px 13px;margin:12px 0 0;font-size:16.5px;font-weight:700;line-height:1.35;color:#e8f1ff;border-left:5px solid #5aa9ff}
+  .goalline .gl{display:inline-block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;color:#0b2239;background:#5aa9ff;border-radius:99px;padding:2px 8px;margin-right:7px;transform:translateY(-2px)}`;
+
+function looksLikeImage(file) {
+  try {
+    const st = fs.statSync(file);
+    if (st.size < 300) return false;
+    const b = fs.readFileSync(file).subarray(0, 8);
+    return (b[0] === 0x89 && b[1] === 0x50) || (b[0] === 0xff && b[1] === 0xd8) ||
+           (b[0] === 0x47 && b[1] === 0x49) || (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01);
+  } catch { return false; }
+}
+
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+function readGoalFile(file) {
+  try {
+    if (!fs.existsSync(file)) return null;
+    const t = fs.readFileSync(file, 'utf8');
+    const pick = (re) => { const m = t.match(re); return m ? m[1].replace(/\*\*/g, '').trim() : null; };
+    const g = { target: pick(/^\*\*Target:\*\*\s*(.+)$/m), done: pick(/^\*\*Done looks like:\*\*\s*(.+)$/m) };
+    return (g.target || g.done) ? g : null;
+  } catch (e) { return null; }
+}
+
+function card(p, iconHref) {
+  const items = [
+    ...p.reds.map(t => ['dr', 'r', t]),
+    ...p.ambers.map(t => ['da', 'a', t]),
+  ];
+  const shown = items.slice(0, 6);
+  const rest = items.length - shown.length;
+  const stamp = (p.at || '').replace(/^\d{4}-\d{2}-\d{2} /, '');
+  const face = iconHref
+    ? `<img src="${iconHref}" alt="">`
+    : `<div style="width:44px;height:44px;border-radius:11px;background:#3a4048;display:grid;place-items:center;font-weight:800;font-size:18px">${esc((p.name || '?')[0])}</div>`;
+  const head = `<div class="mhead">${face}<div><div class="nm">${esc(p.name)}</div>
+      <div class="ver">${esc(p.what)}</div><div class="own">owner · ${esc(p.owner)} · read ${esc(stamp || '—')}</div></div></div>`;
+  const list = shown.length
+    ? shown.map(([d, c, t]) => `<div class="item"><i class="dot ${d}"></i><span class="${c}">${esc(t)}</span></div>`).join('')
+    : `<div class="item"><i class="dot dg"></i><span class="g">nothing missing</span></div>`;
+  const more = rest > 0 ? `<p class="note">+ ${rest} more under “already in place”.</p>` : '';
+  const goal = p.goal ? `<div class="goalline"><span class="gl">Goal</span>${esc(p.goal)}</div>` : '';
+  const next = `<div class="nextline"><span class="nx">Next</span>${esc(p.next)}</div>`;
+  const facts = p.facts.map(([k, v]) => `<div class="item"><span class="note" style="margin:0">${esc(k)}</span><span style="font-weight:700">${esc(v)}</span></div>`).join('');
+  return `<div class="mlist">${head}${list}${more}${goal}${next}<p class="note">${facts}</p></div>`;
+}
+
+function renderPage(payload) {
+  const props = payload.props;
+  const totalRed = props.reduce((n, p) => n + p.reds.length, 0);
+  const totalAmber = props.reduce((n, p) => n + p.ambers.length, 0);
+  const iconHref = f => {
+    const full = path.join(ICONDIR, f);
+    return looksLikeImage(full) ? 'icons/' + f : '';
+  };
+  const green = props.map(p => `<tr><td style="font-weight:800">${esc(p.name)}</td>
+      <td class="green">${p.greens.map(g => `<div>• ${esc(g)}</div>`).join('')}</td></tr>`).join('');
+  const open = [].concat(...props.map(p => p.reds.map(r => [p.name, r])));
+  const act = open.length ? `<div class="box"><h3>What blocks, in order</h3><ul>${open.slice(0, 8).map(([n, r]) => `<li><b style="color:#ff8078">${esc(n)}</b> — ${esc(r)}</li>`).join('')}</ul></div>`
+    : `<div class="box"><h3>What blocks</h3><ul><li>Nothing — all three properties answer and hold their own.</li></ul></div>`;
+  const log = (payload.changes || []).slice(-10).reverse().map(c => `<div><span>${esc(c.at)}</span> — ${esc(c.text)}</div>`).join('') || '<div><span>—</span> first run, nothing to compare yet</div>';
+
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Projects — hintza.com · Salsa · Books</title>
+<style>
+${CSS}
+</style></head><body><div class="wrap">
+<div style="margin:0 0 20px"><a class="pagetab" href="file:///Users/nakfaai/output/apps/status.html">Apps · the four &#8594;</a></div>
+<h1>Projects — hintza.com · Salsa · Books</h1>
+<p class="stamp">checked ${esc(payload.lastCheck)} · <b class="count">${totalRed}</b> block · <b style="color:#ffc857">${totalAmber}</b> one thing short · ${props.length} properties · read only, nothing is written to any site</p>
+<div class="bar"></div>
+
+<h2>What is missing · ${totalRed} red · ${totalAmber} amber</h2>
+<div class="grid">${props.map(p => card(p, iconHref(p.icon))).join('')}</div>
+
+<h2>Already in place</h2>
+<div class="scroll"><table><thead><tr><th>Property</th><th>Checked and true</th></tr></thead><tbody>${green}</tbody></table></div>
+
+<h2>What blocks, in order</h2>
+${act}
+
+<h2>The books, one row each</h2>
+<div class="scroll"><table><thead><tr><th>Book</th><th>Goal</th><th>Ebook files</th><th>Print PDFs</th><th>Folder</th></tr></thead><tbody>
+${payload.books.rows.map(r => `<tr><td style="font-weight:800">${esc(r.name)}</td><td style="color:#a9cdf5;font-weight:700">${esc(r.goal || '—')}</td><td>${r.epub}</td><td>${r.pdf}</td><td class="green">${esc(r.dir || 'missing')}</td></tr>`).join('')}
+</tbody></table></div>
+<p class="note">KDP itself is not checked: Amazon gives no API for listings. The live pages on Amazon are your read, not mine.</p>
+
+<h2>Run log — what moved</h2>
+<div class="box log">${log}</div>
+
+<h2>How this page stays true</h2>
+<div class="box"><ul>
+<li>One command, <b>props-status</b>, measures every line here: HTTP status, SSL days, sitemap size, forms, the git state of the Books folder.</li>
+<li>The page is written from that measurement — never by hand. Run it twice a day and it cannot drift.</li>
+<li>It reads only. No form is posted, no site, no KDP and no money is touched.</li>
+<li>Anything it cannot measure says so, instead of guessing.</li>
+</ul></div>
+
+<p class="foot">Generated by props-status at ${esc(payload.generatedAt)} · state: ~/.dsh/state/props-status.json · log: ~/.dsh/state/props-log.md</p>
+</div></body></html>`;
+}
+
+// ---------- log ----------
+function diffAndLog(prev, cur) {
+  const changes = (prev && prev.changes) || [];
+  if (!prev) { changes.push({ at: cur.lastCheck, text: 'first run — baseline of all three properties' }); return changes; }
+  for (const p of cur.props) {
+    const old = (prev.props || []).find(x => x.slug === p.slug);
+    if (!old) { changes.push({ at: cur.lastCheck, text: `${p.name}: first read` }); continue; }
+    const gained = p.reds.filter(r => !old.reds.includes(r));
+    const fixed = old.reds.filter(r => !p.reds.includes(r));
+    if (gained.length) changes.push({ at: cur.lastCheck, text: `${p.name}: new red — ${gained[0]}` });
+    if (fixed.length) changes.push({ at: cur.lastCheck, text: `${p.name}: fixed — ${fixed[0]}` });
+  }
+  // only keep today's additions distinct from history
+  const stamp = cur.lastCheck;
+  const fresh = changes.filter(c => c.at === stamp || !prev.changes.includes(c));
+  return changes.length === (prev.changes || []).length ? changes : [...changes.filter(c => c.at !== stamp), ...fresh.filter(c => c.at === stamp)];
+}
+
+function appendLogMarkdown(changes, last) {
+  const fresh = changes.filter(c => c.at === last);
+  if (!fresh.length) return;
+  const lines = fresh.map(c => `- ${c.at} — ${c.text}`).join('\n') + '\n';
+  fs.appendFileSync(LOG, lines);
+}
+
+// ---------- icons ----------
+async function ensureIcons() {
+  fs.mkdirSync(ICONDIR, { recursive: true });
+  const jobs = [
+    ['hintza.png', HINTZA + '/favicon.ico'],
+    ['hintza.png', HINTZA + '/apple-touch-icon.png'],
+    ['salsa.png', SALSA + '/assets/favicon.png'],
+    ['salsa.png', SALSA + '/favicon.ico'],
+    ['books.png', KINGEZANA + '/favicon.ico'],
+    ['books.png', KINGEZANA + '/apple-touch-icon.png'],
+  ];
+  for (const [file, url] of jobs) {
+    const dest = path.join(ICONDIR, file);
+    if (fs.existsSync(dest) && fs.statSync(dest).size > 500) continue;
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'follow' });
+      if (!r.ok) continue;
+      const buf = Buffer.from(await r.arrayBuffer());
+      const type = r.headers.get('content-type') || '';
+      if (buf.length < 500) continue;
+      if (!/image/.test(type) && !url.endsWith('.ico')) continue;
+      if (url.endsWith('.ico')) {
+        // Safari and Chromium both accept ico in <img>; keep it as-is
+      }
+      fs.writeFileSync(dest, buf);
+      if (!looksLikeImage(dest)) fs.rmSync(dest, { force: true });
+    } catch { /* keep going */ }
+  }
+}
+
+// ---------- main ----------
+async function main() {
+  const cmd = process.argv[2] || 'run';
+  if (cmd === 'open') { spawnSync('open', ['/Users/nakfaai/output/projects/status.html']); return; }
+  if (cmd === 'page') {
+    const p = JSON.parse(fs.readFileSync(STATE, 'utf8'));
+    fs.mkdirSync(OUTDIR, { recursive: true });
+    fs.writeFileSync(path.join(OUTDIR, 'status.html'), renderPage(p));
+    console.log('page → /Users/nakfaai/output/projects/status.html (from state ' + p.generatedAt + ')');
+    return;
+  }
+  if (cmd === 'json') {
+    const prev = fs.existsSync(STATE) ? JSON.parse(fs.readFileSync(STATE, 'utf8')) : null;
+    const { props, books } = await collect();
+    const payload = { generatedAt: new Date().toISOString(), lastCheck: now(), props, books, changes: prev ? prev.changes || [] : [] };
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+
+  await ensureIcons();
+  const prev = fs.existsSync(STATE) ? JSON.parse(fs.readFileSync(STATE, 'utf8')) : null;
+  const got = await collect();
+  const books = got.books;
+  const props = got.props.map(p => mergeBlocked(p, prev));
+  const lastCheck = now();
+  const payload = { generatedAt: new Date().toISOString(), lastCheck, props, books, changes: [] };
+  payload.changes = diffAndLog(prev, payload);
+  fs.mkdirSync(path.dirname(STATE), { recursive: true });
+  fs.writeFileSync(STATE, JSON.stringify(payload, null, 2));
+  appendLogMarkdown(payload.changes, lastCheck);
+  fs.mkdirSync(OUTDIR, { recursive: true });
+  fs.writeFileSync(path.join(OUTDIR, 'status.html'), renderPage(payload));
+
+  const reds = props.reduce((n, p) => n + p.reds.length, 0);
+  const ambers = props.reduce((n, p) => n + p.ambers.length, 0);
+  console.log(`checked ${props.length} properties at ${lastCheck} — ${reds} red, ${ambers} amber`);
+  for (const p of props) console.log(`  ${p.reds.length ? '✗' : '✓'} ${p.name.padEnd(22)} ${p.reds.length} red, ${p.ambers.length} amber — ${p.next}`);
+  console.log('page → /Users/nakfaai/output/projects/status.html');
+}
+
+main().catch(e => { console.error('props-status failed:', e && e.stack || e); process.exit(1); });

@@ -183,3 +183,45 @@ The source drive is never written to; only the destination fills.
 
 **The rule that would have saved the whole afternoon:** confirm the drive's health with a
 large-block read before forming any theory about what is wrong with it.
+
+## 2026-10-19 — Netbrew "No such module 'Expo'" and the Xcode Cloud connect
+
+**Symptoms:** Xcode showed `No such module 'Expo'` at `ios/Netbrew/AppDelegate.swift:1:17`, about 20 "module map file not found" errors and a "No Scheme" toolbar; the same project built fine from the command line.
+
+**Causes, in order:**
+1. Xcode had **`Netbrew.xcodeproj`** open instead of **`Netbrew.xcworkspace`** — the Pods live only in the workspace, so Expo's module map was invisible.
+2. A second stale window held the same project: `Couldn't load 'Netbrew.xcodeproj' because it is already opened from another project or workspace`.
+3. A corrupt per-project build folder `~/Library/Developer/Xcode/DerivedData/Netbrew-dhmcvqjzfywxcrgyrbdacgoskwwp` held only `SymbolCache`, and Xcode's saved window state reopened the broken layout on every launch.
+
+**Fix that worked:** quit Xcode (`quit saving no`), delete **all** `~/Library/Developer/Xcode/DerivedData/Netbrew-*`, delete `~/Library/Saved Application State/com.apple.dt.Xcode.savedState`, reopen `ios/Netbrew.xcworkspace` only. One window, scheme **Netbrew**, destination iPhone 18 Pro → it built. Running `pod install --repo-update` in `ios/` beforehand repaired the Pods project itself.
+
+**Xcode Cloud traps:**
+- The Cloud product was bound to the wrong GitHub repo (`ammaniel-knowledge`) because `/Users/nakfaai/Developer/projects` is itself a git repo, so Xcode computed the path as `facelink/ios/Netbrew.xcodeproj`; build 1 failed with `Project Netbrew.xcodeproj does not exist at facelink/ios/Netbrew.xcodeproj`. Each app folder must be its own clone with its own `origin`.
+- Integrate → Create Workflow on a stale product fails with "This workflow has no actions" and then "Failed to create workflow — An unexpected error occurred (XcodeCloudKit … CommandHandlerError:5)"; deleting the old product (`DELETE /v1/ciProducts/<id>` → 204) and starting fresh is faster than repairing it.
+- The Cloud "Select Product" sheet lists **Pod frameworks first** (`AppAuth`, `EXConstants`, `Expo`…). The app target sits at the bottom of that list — picking a framework creates a workflow for the wrong thing.
+
+**What I would do differently:**
+- Never diagnose an Xcode build error from the GUI while a command-line build of the same scheme succeeds — the difference is window/workspace state, not code.
+- Verify before saying "it works": I said "✅ Netbrew builds in Xcode now" without seeing the build finish, and Ammaniel called it out.
+- A sandboxed shell cannot send Apple Events (`osascript … quit` → `-10004 privilege violation`) and cannot write under `~/.dsh` (`Operation not permitted`). Anything that quits or cleans Xcode goes to an **unsandboxed Bot** — netbrew quit Xcode, wiped the DerivedData and reopened the workspace in one run.
+
+---
+## Kalkidan → Xcode Cloud, 2026-10-20 (the long one)
+
+**What was broken, in order — each one hid the next:**
+1. **Wrong repo in the workflow.** The product `App` (`295e69a9-f37f-4921-ab30-0c6073da4671`) had its Primary Repository on `latindance.git` and container path `apps/capacitor/ios/App/App.xcworkspace`, so builds 1–26 compiled Latindance code while the window showed Kalkidan. Apple's API refuses the change (`PATCH /v1/ciWorkflows/{id}` → 409 `ENTITY_ERROR.RELATIONSHIP.NOT_ALLOWED`; creating products/workflows → 405/409). Only the pencil in Xcode can re-point it.
+2. **Repo was gitignoring `ios/`.** `ci_post_clone` passed, then the build died on `Build input file cannot be found: /Volumes/workspace/repository/ios/App/App/Base.lproj/Main.storyboard`. Storyboards, asset catalogs and `GoogleService-Info.plist` were never committed. Fix: force-add them (`git add -f`) — 10 files, commit `e750782` → first green build 30.
+3. **No `corepack` on Apple's image any more.** `brew install node` succeeded (Homebrew Node 26.12.0) and the next line failed: `corepack: command not found` (`ci_post_clone.sh: line 11`). Node 26 dropped corepack. Fix: `npm install --global pnpm@11.15.1` + `export PATH="$(npm prefix --global)/bin:$PATH"` → commit `64a5ecd`; the build got past setup and then hit trap 2.
+4. **Build green but never distributable.** The workflow had only a **Build** action. Cloud's "You're ready to set up this product for distribution" prompt is the switch: Set Up → Archive + TestFlight/App Store. Build 31 is the first run after it.
+
+**Rules learned:**
+- An Xcode Cloud product named "App" is not evidence of anything — three Capacitor apps use that name. Identify a product by the **commit** its builds carry, not the name.
+- Green build ≠ finished. `Build` alone leaves the artefact on Apple's machine; distribution needs the Archive action.
+- A build number in a repo can ride along silently (a bot once pushed 16 → 17 inside a signing fix). Re-read `CURRENT_PROJECT_VERSION` after every bot commit.
+- `corepack`, `nvm`, `gem` are traps on Apple's image; keep `ci_post_clone.sh` to PATH exports + a plain package manager install.
+
+**What I would do differently:**
+- Download the **LOG_BUNDLE** on the first red build, not the fourth. `ci_post_clone.log` names the failing line in one look; the Xcode report only says "script failed".
+- Check `.gitignore` for the app folder *before* blaming CI: two builds were spent re-writing a script that was already correct.
+- Say "the product in your window is Latindance's" the moment the commit shas do not match the app — I said it late and it cost hours of him clicking the wrong window.
+

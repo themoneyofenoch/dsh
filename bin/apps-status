@@ -1,0 +1,764 @@
+#!/usr/bin/env node
+// apps-status — the one command that reads all four apps from Apple and Google.
+//
+//   apps-status                 read every app, log what moved, rewrite the page
+//   apps-status one <slug>      one app only (also logs + rewrites the page)
+//   apps-status json            the same read, JSON on stdout, no log, no page
+//   apps-status page            rewrite /Users/nakfaai/output/apps/status.html from the last JSON
+//   apps-status gates           show what is gated right now
+//   apps-status gates set <kind> <key> <value>    record Ammaniel's yes (kind: version|submit|spend)
+//   apps-status gates clear <kind> [key]           remove a recorded yes
+//   apps-status <store verb> <slug> [args…]       write through storeship in that app's folder
+//
+// Every run appends one line to ~/.dsh/state/apps-log.md (what moved since the last run),
+// and the page is rendered from the JSON — never written by hand.
+//
+// READ IS FREE. Three calls are refused by this file itself, not by anyone's memory:
+//   version   no version/build number moves unless the gate file names that exact number
+//   submit    review submission never happens from here
+//   spend     no money-moving verb exists
+//
+// Full access = everything else runs without a permission card, and every write
+// prints the exact command it ran as one `WRITE …` line.
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFileSync, spawnSync } from 'node:child_process';
+
+const HOME = process.env.HOME;
+const STATE = path.join(HOME, '.dsh/state');
+const GATE_FILE = path.join(STATE, 'apps-gates.json');
+const OUT_FILE = path.join(STATE, 'apps-status.json');
+const STORESHIP = path.join(HOME, '.dsh/bin/storeship');
+const KEY_ID = 'DASF43QDRT';
+const ISSUER = '0418454e-4e54-4fc7-a387-b3b2460fd5e8';
+const KEY_PATH = path.join(HOME, 'Developer/private_keys/AuthKey_' + KEY_ID + '.p8');
+const PLAY_KEY = path.join(HOME, 'Developer/private_keys/google-play-key.json');
+const P = '/Users/nakfaai/Developer/projects';
+
+// Verified 2026-10-20 against both APIs — Netbrew's store id is the legacy com.silki.app.
+const APPS = [
+  { slug: 'kalkidan', name: 'Kalkidan', bundleId: 'com.kalkidan.app', playPackage: 'com.kalkidan.app', dir: `${P}/kalkidan`, icon: '/Users/nakfaai/output/apps/icons/kalkidan.png' },
+  { slug: 'pixwee', name: 'Pixwee', bundleId: 'com.pixwee.app', playPackage: 'com.pixwee.app', dir: `${P}/pixwee`, icon: '/Users/nakfaai/output/apps/icons/pixwee.png', artDir: '/Users/nakfaai/output/pixwee-store-art' },
+  { slug: 'netbrew', name: 'Netbrew', bundleId: 'com.silki.app', playPackage: 'com.silki.app', dir: `${P}/netbrew`, icon: '/Users/nakfaai/output/apps/icons/netbrew.png' },
+  { slug: 'geezeasy', name: 'GeezEasy', bundleId: 'com.geezeasy.app', playPackage: 'com.geezeasy.app', dir: `${P}/GeezEasy`, icon: '/Users/nakfaai/output/apps/icons/geezeasy.png' },
+];
+
+const args = process.argv.slice(2);
+const VERB = args[0] && !args[0].startsWith('-') ? args[0] : 'status';
+const SHOW_CALLS = process.env.APPS_VERBOSE === '1';
+
+function die(msg) { console.error('✗ ' + msg); process.exit(1); }
+function call(label) { if (SHOW_CALLS) console.error('  → ' + label); }
+function writeCall(cmd) { console.log('WRITE ' + cmd); }
+
+// ── gates ────────────────────────────────────────────────────────────────────
+function loadGates() {
+  try { return JSON.parse(fs.readFileSync(GATE_FILE, 'utf8')); }
+  catch { return { version: {}, submit: null, spend: [] }; }
+}
+function assertGate(kind, key, value) {
+  const g = loadGates();
+  if (kind === 'version') {
+    const want = (g.version || {})[key];
+    if (!want || String(want) !== String(value))
+      die(`REFUSED version change ${key} → ${value}. Approved numbers: ${JSON.stringify(g.version || {})}. Ammaniel must name this exact number first.`);
+  } else if (kind === 'submit') {
+    if (!g.submit || g.submit.key !== key || !g.submit.at)
+      die('REFUSED review submission. Only Ammaniel presses Submit; this tool never does.');
+    return;
+  } else if (kind === 'spend') {
+    if (!(g.spend || []).includes(key)) die(`REFUSED spend ${key}.`);
+  }
+  console.log(`GATE OK ${kind} ${key} ${value}`);
+}
+
+// ── Apple ────────────────────────────────────────────────────────────────────
+const b64 = (b) => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function ascToken() {
+  const n = Math.floor(Date.now() / 1000);
+  const h = b64(JSON.stringify({ alg: 'ES256', kid: KEY_ID, typ: 'JWT' }));
+  const p = b64(JSON.stringify({ iss: ISSUER, iat: n, exp: n + 900, aud: 'appstoreconnect-v1' }));
+  const i = h + '.' + p;
+  return i + '.' + b64(crypto.sign('sha256', Buffer.from(i), { key: fs.readFileSync(KEY_PATH, 'utf8'), dsaEncoding: 'ieee-p1363' }));
+}
+let ASC = null;
+const TIMEOUT = 12000;
+async function asc(p) {
+  ASC = ASC || ascToken();
+  call('ASC GET ' + p.split('?')[0]);
+  const r = await fetch('https://api.appstoreconnect.apple.com' + p, { headers: { Authorization: 'Bearer ' + ASC }, signal: AbortSignal.timeout(TIMEOUT) });
+  const t = await r.text();
+  if (!r.ok) throw new Error(`ASC ${p.split('?')[0]} -> ${r.status} ${t.slice(0, 160)}`);
+  return t ? JSON.parse(t) : null;
+}
+async function ascAll(p) {
+  let out = []; let next = p;
+  while (next) {
+    const j = await asc(next);
+    out = out.concat(j.data || []);
+    next = j.links && j.links.next ? j.links.next.replace('https://api.appstoreconnect.apple.com', '') : null;
+  }
+  return out;
+}
+
+async function appleState(app) {
+  const out = { bundleId: app.bundleId, ok: false, reds: [], greens: [], notes: [] };
+  try {
+    const found = await asc(`/v1/apps?filter[bundleId]=${encodeURIComponent(app.bundleId)}&limit=1`);
+    const a = (found.data || [])[0];
+    if (!a) { out.reds.push('Apple: app not found for ' + app.bundleId); return out; }
+    out.appId = a.id;
+    const vres = await asc(`/v1/apps/${a.id}/appStoreVersions?limit=6&include=build`);
+    const chart = (vres.included || []).filter((x) => x.type === 'builds');
+    out.versions = (vres.data || []).slice(0, 4).map((v) => {
+      const b = chart.find((x) => x.id === (v.relationships?.build?.data?.id));
+      return { id: v.id, version: v.attributes.versionString, state: v.attributes.appStoreState, created: v.attributes.createdDate, build: b ? { version: b.attributes.version, state: b.attributes.processingState, uploaded: b.attributes.uploadedDate } : null };
+    });
+    const live = out.versions.find((v) => v.state === 'READY_FOR_SALE');
+    const current = out.versions.find((v) => !['READY_FOR_SALE', 'DEVELOPER_REMOVED_FROM_SALE'].includes(v.state)) || out.versions[0];
+    out.live = live ? { version: live.version, build: live.build?.version || null } : null;
+    out.current = current ? { id: current.id, version: current.version, state: current.state, build: current.build } : null;
+
+    if (!out.versions.length) out.reds.push('Apple: no version created');
+    else if (!out.current?.build) out.reds.push(`Apple: ${out.current?.version || '?'} has no build attached`);
+    else if (out.current.build.state && out.current.build.state !== 'VALID') out.reds.push(`Apple: build ${out.current.build.version} is ${out.current.build.state}`);
+
+    // screenshots + listing text on the newest version
+    if (current) {
+      const locs = await asc(`/v1/appStoreVersions/${current.id}/appStoreVersionLocalizations?limit=10`);
+      const loc = (locs.data || [])[0];
+      out.locale = loc?.attributes?.locale || null;
+      out.keywords = loc?.attributes?.keywords || '';
+      out.descriptionLen = (loc?.attributes?.description || '').length;
+      out.supportUrl = loc?.attributes?.supportUrl || '';
+      out.marketingUrl = loc?.attributes?.marketingUrl || '';
+      if (!out.keywords) out.reds.push('Apple: keywords empty');
+      if (!out.descriptionLen) out.reds.push('Apple: description empty');
+      if (!out.supportUrl) out.reds.push('Apple: support URL empty');
+      if (loc) {
+        const sets = await asc(`/v1/appStoreVersionLocalizations/${loc.id}/appScreenshotSets?include=appScreenshots&limit=20`);
+        out.shots = {};
+        for (const s of sets.data || []) {
+          const n = (sets.included || []).filter((x) => x.type === 'appScreenshots' && s.relationships?.appScreenshots?.data?.some((d) => d.id === x.id)).length;
+          out.shots[s.attributes.screenshotDisplayType] = n;
+        }
+        if (!out.shots['APP_IPHONE_67'] && !out.shots['APP_IPHONE_65']) out.reds.push('Apple: no iPhone 6.5/6.7 screenshots');
+        const thin = Object.entries(out.shots).filter(([, n]) => n > 0 && n < 3).map(([t, n]) => `${t} ${n}`);
+        if (thin.length) out.notes.push('thin screenshots: ' + thin.join(', '));
+        if (!out.shots['APP_IPAD_PRO_3GEN_129'] && !out.shots['APP_IPAD_PRO_129']) out.notes.push('no iPad screenshots');
+      }
+    }
+
+    // app info: category, privacy, age rating
+    const infosRes = await asc(`/v1/apps/${a.id}/appInfos?limit=5&include=primaryCategory,ageRatingDeclaration`);
+    const infos = infosRes.data || [];
+    const info = infos.find((i) => !['READY_FOR_SALE'].includes(i.attributes.appStoreState)) || infos[0];
+    if (info) {
+      out.category = info.relationships?.primaryCategory?.data?.id || '';
+      out.ageRating = info.relationships?.ageRatingDeclaration?.data?.id ? 'set' : 'empty';
+      if (!out.category) out.reds.push('Apple: no primary category');
+      if (out.ageRating === 'empty') out.reds.push('Apple: age rating empty');
+      const ils = await asc(`/v1/appInfos/${info.id}/appInfoLocalizations?limit=10`);
+      const il = (ils.data || [])[0];
+      out.privacyUrl = il?.attributes?.privacyPolicyUrl || '';
+      if (!out.privacyUrl) out.reds.push('Apple: privacy policy URL empty');
+      out.appStoreState = info.attributes.appStoreState;
+    }
+
+    // builds + testflight
+    const bl = await ascAll(`/v1/apps/${a.id}/builds?limit=50`);
+    out.buildList = bl.map((b) => ({ version: b.attributes.version, state: b.attributes.processingState, uploaded: b.attributes.uploadedDate }));
+    out.buildsTotal = out.buildList.length;
+    out.newestBuild = out.buildList.map((b) => Number(b.version)).filter((n) => !Number.isNaN(n)).sort((x, y) => y - x)[0] ?? null;
+    try {
+      const bg = await ascAll(`/v1/betaGroups?filter[app]=${a.id}&limit=20`);
+      out.betaGroups = (bg || []).map((g) => ({ name: g.attributes.name, external: g.attributes.isInternalGroup === false || g.attributes.publicLinkEnabled, publicLink: g.attributes.publicLinkEnabled }));
+      if (!(bg || []).length) out.reds.push('Apple: no TestFlight group');
+    } catch (e) { out.notes.push('testflight not checked (' + e.message.slice(0, 60) + ')'); }
+
+    // Xcode Cloud — Apple's own build service, read for the same app id
+    out.ci = await ciState(a.id);
+    if (!out.ci.ok && out.ci.reds.length) out.reds.push(...out.ci.reds);
+    if (out.ci.notes.length) out.notes.push(...out.ci.notes);
+    out.ok = true;
+  } catch (e) {
+    out.reds.push('Apple: ' + e.message.slice(0, 160));
+  }
+  return out;
+}
+
+// ── Google Play ──────────────────────────────────────────────────────────────
+let PLAY_TOK = null;
+async function playToken() {
+  const sa = JSON.parse(fs.readFileSync(PLAY_KEY, 'utf8'));
+  const now = Math.floor(Date.now() / 1000);
+  const head = b64(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const body = b64(JSON.stringify({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/androidpublisher', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
+  const sig = crypto.createSign('RSA-SHA256').update(head + '.' + body).sign(sa.private_key, 'base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=' + head + '.' + body + '.' + sig, signal: AbortSignal.timeout(TIMEOUT) });
+  const j = await r.json();
+  if (!j.access_token) throw new Error('play token: ' + JSON.stringify(j).slice(0, 160));
+  return j.access_token;
+}
+async function play(method, p) {
+  PLAY_TOK = PLAY_TOK || await playToken();
+  call('PLAY ' + method + ' ' + p.replace(/\/edits\/[^/]+/, '/edits/{edit}'));
+  const r = await fetch('https://androidpublisher.googleapis.com/androidpublisher/v3' + p, { method, headers: { Authorization: 'Bearer ' + PLAY_TOK }, signal: AbortSignal.timeout(TIMEOUT) });
+  const t = await r.text();
+  if (!r.ok) throw new Error(`PLAY ${method} ${p.replace(/\/edits\/[^/]+/, '/edits/{edit}')} -> ${r.status} ${t.slice(0, 160)}`);
+  return t ? JSON.parse(t) : null;
+}
+
+async function playState(app) {
+  const out = { package: app.playPackage, ok: false, reds: [], greens: [], notes: [] };
+  let edit = null;
+  try {
+    const e = await play('POST', `/applications/${app.playPackage}/edits`);
+    edit = e.id;
+    const tracks = await play('GET', `/applications/${app.playPackage}/edits/${edit}/tracks`);
+    out.tracks = {};
+    for (const t of tracks.tracks || []) {
+      const rel = (t.releases || [])[0];
+      out.tracks[t.track] = rel ? { status: rel.status, versionCodes: rel.versionCodes || [], rollout: rel.userFraction ?? null } : null;
+    }
+    const prod = out.tracks.production;
+    if (!prod) out.reds.push('Play: production track empty');
+    const listings = await play('GET', `/applications/${app.playPackage}/edits/${edit}/listings`);
+    const l = (listings.listings || [])[0];
+    out.playLocale = l?.language || null;
+    out.playTitle = l?.title || '';
+    out.playShortLen = (l?.shortDescription || '').length;
+    out.playFullLen = (l?.fullDescription || '').length;
+    if (!out.playTitle) out.reds.push('Play: no listing title');
+    if (out.playShortLen < 10) out.reds.push('Play: short description missing');
+    if (out.playFullLen < 100) out.reds.push('Play: full description missing');
+    if (l?.language) {
+      out.playImages = {};
+      for (const type of ['phoneScreenshots', 'icon', 'featureGraphic', 'sevenInchScreenshots', 'tenInchScreenshots']) {
+        try {
+          const imgs = await play('GET', `/applications/${app.playPackage}/edits/${edit}/listings/${l.language}/${type}`);
+          out.playImages[type] = (imgs.images || []).length;
+        } catch (e) { out.playImages[type] = '?'; out.notes.push(`Play ${type}: not read (${e.message.slice(0, 70)})`); }
+      }
+      if (!out.playImages.phoneScreenshots) out.reds.push('Play: no phone screenshots');
+      if (!out.playImages.icon) out.reds.push('Play: no 512 icon');
+      if (!out.playImages.featureGraphic) out.reds.push('Play: no feature graphic');
+      if (out.playImages.phoneScreenshots && out.playImages.phoneScreenshots < 2) out.notes.push('only ' + out.playImages.phoneScreenshots + ' phone screenshot');
+    }
+    out.notes.push('content rating / data safety: not checked by API');
+    out.ok = true;
+  } catch (e) {
+    out.reds.push('Play: ' + e.message.slice(0, 160));
+  } finally {
+    if (edit) { try { await play('DELETE', `/applications/${app.playPackage}/edits/${edit}`); } catch {} }
+  }
+  return out;
+}
+
+// ── Xcode Cloud ──────────────────────────────────────────────────────────────
+async function ciState(appId) {
+  const out = { ok: false, reds: [], notes: [], product: null, workflow: null, run: null };
+  try {
+    const prods = await asc(`/v1/ciProducts?filter[app]=${appId}&limit=5`);
+    const prod = (prods.data || [])[0];
+    if (!prod) { out.reds.push('Xcode Cloud: not connected'); return out; }
+    out.product = prod.attributes.name;
+    const wfs = await asc(`/v1/ciProducts/${prod.id}/workflows?limit=5`);
+    const wf = (wfs.data || [])[0];
+    if (!wf) { out.reds.push('Xcode Cloud: product with no workflow'); return out; }
+    out.workflow = wf.attributes.name;
+    const runs = await asc(`/v1/ciWorkflows/${wf.id}/buildRuns?limit=10`);
+    const r = (runs.data || []).slice().sort((x, y) => Number(y.attributes.number) - Number(x.attributes.number))[0];
+    if (!r) { out.notes.push('Xcode Cloud: no build run yet'); out.ok = true; return out; }
+    out.run = { id: r.id, number: r.attributes.number, status: r.attributes.completionStatus, progress: r.attributes.executionProgress, created: r.attributes.createdDate };
+    if (r.attributes.completionStatus === 'FAILED') out.reds.push(`Xcode Cloud: build #${r.attributes.number} failed`);
+    else if (['RUNNING', 'PENDING'].includes(r.attributes.executionProgress)) out.notes.push(`Xcode Cloud: build #${r.attributes.number} ${r.attributes.executionProgress.toLowerCase()}`);
+    out.ok = true;
+  } catch (e) {
+    out.notes.push('Xcode Cloud: read failed (' + e.message.slice(0, 70) + ')');
+  }
+  return out;
+}
+
+// ── repo ─────────────────────────────────────────────────────────────────────
+function repoState(app) {
+  const out = { dir: app.dir, reds: [], greens: [], notes: [] };
+  try {
+    const dirty = execFileSync('git', ['-C', app.dir, 'status', '--porcelain'], { encoding: 'utf8', timeout: 90000, killSignal: 'SIGKILL' }).trim();
+    out.dirty = dirty ? dirty.split('\n').length : 0;
+    if (out.dirty) out.reds.push(`GitHub: ${out.dirty} files not committed`);
+    const branch = execFileSync('git', ['-C', app.dir, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).trim();
+    out.branch = branch;
+    const head = execFileSync('git', ['-C', app.dir, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
+    out.head = head;
+    const iconFile = execFileSync('bash', ['-lc', `find "${app.dir}" \\( -name node_modules -o -name Pods -o -name .git -o -name build -o -name DerivedData -o -name .gradle -o -name .next -o -name dist \\) -prune -o -path '*AppIcon.appiconset/*.png' -print | head -1`], { encoding: 'utf8', timeout: 25000, killSignal: 'SIGKILL' }).trim();
+    if (iconFile) {
+      const w = (execFileSync('sips', ['-g', 'pixelWidth', iconFile], { encoding: 'utf8' }).match(/pixelWidth:\s*(\d+)/) || [])[1];
+      out.icon1024 = w ? Number(w) : null;
+      out.iconFile = iconFile;
+      if (!out.icon1024 || out.icon1024 < 1024) out.reds.push(`Apple: app icon is ${w || '?'}px wide, 1024 needed`);
+    } else out.reds.push('Apple: no app icon png found in the asset catalog');
+  } catch (e) {
+    out.notes.push('repo not checked: ' + e.message.slice(0, 100));
+  }
+  return out;
+}
+
+// ── read one app ─────────────────────────────────────────────────────────────
+async function readApp(app) {
+  const apple = await appleState(app);
+  const playS = await playState(app);
+  const repo = repoState(app);
+  const reds = [...apple.reds, ...playS.reds, ...repo.reds];
+  const greens = [...apple.greens, ...playS.greens, ...repo.greens];
+  const artReady = app.artDir ? fs.existsSync(app.artDir) : null;
+  return { slug: app.slug, name: app.name, bundleId: app.bundleId, playPackage: app.playPackage, artReady, apple, play: playS, repo, reds, greens, notes: [...apple.notes, ...playS.notes, ...repo.notes] };
+}
+
+// ── print ────────────────────────────────────────────────────────────────────
+function icon(row) {
+  if (row.apple.current?.state === 'WAITING_FOR_REVIEW' || row.apple.current?.state === 'IN_REVIEW') return '🟡';
+  if (row.reds.length === 0) return '✅';
+  if (row.reds.some((r) => /no build attached|no version created|production track empty/.test(r))) return '🔴';
+  return '🟡';
+}
+function line(row) {
+  const a = row.apple.current ? `${row.apple.current.version} ${row.apple.current.state}${row.apple.current.build ? ' build ' + row.apple.current.build.version : ' no build'}` : 'no version';
+  const live = row.apple.live ? ` · live ${row.apple.live.version}` : '';
+  const t = row.play.tracks || {};
+  const playTxt = Object.entries(t).filter(([, v]) => v).map(([k, v]) => `${k} ${v.versionCodes.join(',')}`).join(' / ') || 'no releases';
+  return `${icon(row)} ${row.name.padEnd(9)} Apple ${a}${live} | Play ${playTxt} | ${row.reds.length} red`;
+}
+
+// ── log + page ───────────────────────────────────────────────────────────────
+const LOG_FILE = path.join(STATE, 'apps-log.md');
+const PAGE_FILE = '/Users/nakfaai/output/apps/status.html';
+const OWNER = { kalkidan: 'Kalkidan', pixwee: 'Pixwee', netbrew: 'netbrew', geezeasy: 'GeezEsay' };
+const APP_DIR = Object.fromEntries(APPS.map((a) => [a.slug, a.dir]));
+const SHOT_LABEL = {
+  APP_IPHONE_67: '6.7"', APP_IPHONE_65: '6.5"', APP_IPHONE_61: '6.1"', APP_IPHONE_55: '5.5"',
+  APP_IPHONE_47: '4.7"', APP_IPAD_PRO_3GEN_129: 'iPad 12.9"', APP_IPAD_PRO_129: 'iPad 12.9"',
+  APP_IPAD_PRO_3GEN_11: 'iPad 11"', APP_IPAD_97: 'iPad 9.7"', APP_IPHONE_58: '5.8"',
+};
+const STATE_WORD = {
+  WAITING_FOR_REVIEW: 'in review', IN_REVIEW: 'in review', PREPARE_FOR_SUBMISSION: 'not sent',
+  READY_FOR_SALE: 'live', PENDING_DEVELOPER_RELEASE: 'ready to release', PROCESSING_FOR_APP_STORE: 'processing',
+  REJECTED: 'rejected', DEVELOPER_REJECTED: 'rejected', METADATA_REJECTED: 'rejected', INVALID_BINARY: 'invalid binary',
+};
+
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function stateWord(s) { return STATE_WORD[s] || String(s || '').toLowerCase().replace(/_/g, ' '); }
+function fmtChicago(date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(date);
+  const g = (t) => (parts.find((p) => p.type === t) || {}).value;
+  return `${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')}`;
+}
+function stamp() { return fmtChicago(new Date()); }
+function appendLog(text) {
+  fs.mkdirSync(STATE, { recursive: true });
+  fs.appendFileSync(LOG_FILE, stamp() + ' · ' + String(text).replace(/\s*\n\s*/g, ' ') + '\n');
+}
+function readLog(n) {
+  try { return fs.readFileSync(LOG_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-n).reverse(); }
+  catch { return []; }
+}
+function safeJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
+function short(t, n) { n = n || 46; return t.length > n ? t.slice(0, n - 1) + '…' : t; }
+
+function logRun(prev, rows) {
+  const before = new Map(((prev && prev.apps) || []).map((a) => [a.slug, a]));
+  const bits = rows.map((r) => {
+    const b = before.get(r.slug);
+    const n = r.reds.length;
+    if (!b) return r.name + ' ' + n + ' red (first check)';
+    const added = r.reds.filter((x) => !b.reds.includes(x));
+    const gone = b.reds.filter((x) => !r.reds.includes(x));
+    const vBefore = b.apple && b.apple.current ? b.apple.current.version : null;
+    const vNow = r.apple && r.apple.current ? r.apple.current.version : null;
+    const moved = vBefore && vNow && vBefore !== vNow ? ` version ${vBefore}→${vNow}` : '';
+    if (!added.length && !gone.length) return r.name + ' ' + n + ' red (=)' + moved;
+    const parts = [];
+    if (gone.length) parts.push('fixed ' + gone.slice(0, 2).map((t) => short(t)).join('; '));
+    if (added.length) parts.push('new ' + added.slice(0, 2).map((t) => short(t)).join('; '));
+    return r.name + ' ' + n + ' red (' + parts.join(', ') + ')' + moved;
+  });
+  appendLog(bits.join(' · '));
+}
+
+function redParts(t) {
+  const i = t.indexOf(': ');
+  if (i > 0 && i <= 16) return [t.slice(0, i), t.slice(i + 2)];
+  const j = t.indexOf(' — ');
+  if (j > 0) return [t.slice(0, j), t.slice(j + 3)];
+  return ['Missing', t];
+}
+
+function ambers(row) {
+  const a = row.apple || {};
+  const out = [];
+  if (a.newestBuild && a.current && a.current.build && String(a.newestBuild) !== String(a.current.build.version))
+    out.push({ label: 'Build ' + a.newestBuild, text: 'uploaded, ' + a.current.build.version + ' is attached' });
+  const s = a.shots || {};
+  const n67 = s.APP_IPHONE_67 || 0;
+  const n65 = s.APP_IPHONE_65 || 0;
+  if (n65 && n67 && n65 < n67) out.push({ label: '6.5" screenshots', text: n65 + ' of ' + n67 });
+  const thin = Object.entries(s).filter(([, n]) => n > 0 && n < 3);
+  if (thin.length) out.push({ label: 'Apple screenshots', text: Math.min(...thin.map(([, n]) => n)) + ' per size on ' + thin.length + ' size' + (thin.length === 1 ? '' : 's') });
+  const pi = (row.play && row.play.playImages) || {};
+  if (pi.phoneScreenshots > 0 && pi.phoneScreenshots < 3) out.push({ label: 'Play screenshots', text: pi.phoneScreenshots + ' only' });
+  for (const n of row.notes || []) if (String(n).startsWith('Xcode Cloud: ')) out.push({ label: 'Xcode Cloud', text: String(n).slice(14) });
+  return out;
+}
+
+function inPlace(r) {
+  const a = r.apple || {};
+  const p = r.play || {};
+  const repo = r.repo || {};
+  const bits = [];
+  if (repo.icon1024) bits.push('<b>icon ' + repo.icon1024 + '</b>');
+  const labeled = Object.entries(a.shots || {}).filter(([, n]) => n > 0).map(([k, n]) => n + '×' + (SHOT_LABEL[k] || k.replace(/APP_/, '').toLowerCase()));
+  if (labeled.length) bits.push(labeled.join(' + '));
+  if (a.privacyUrl) bits.push('privacy');
+  if (a.category) bits.push('category');
+  if (a.ageRating === 'set') bits.push('age');
+  if (a.supportUrl) bits.push('support');
+  if (a.keywords) bits.push('keywords');
+  if (a.descriptionLen) bits.push('description');
+  const pi = p.playImages || {};
+  const playBits = [];
+  if (pi.icon) playBits.push('icon');
+  if (pi.featureGraphic) playBits.push('feature graphic');
+  if (pi.phoneScreenshots) playBits.push(pi.phoneScreenshots + ' shots');
+  if (playBits.length) bits.push('<b>Play ' + playBits.join(' · ') + '</b>');
+  if (a.current && a.current.build) bits.push('build ' + a.current.build.version + ' attached');
+  if (a.ci && a.ci.run && a.ci.run.status === 'SUCCEEDED') bits.push('<b>Xcode Cloud green</b> #' + a.ci.run.number);
+  const prod = p.tracks && p.tracks.production;
+  if (prod && prod.versionCodes && prod.versionCodes.length) bits.push('Play production ' + prod.versionCodes.join(','));
+  if (a.live) bits.push('<b>live ' + a.live.version + '</b>');
+  return bits.length ? bits.join(' · ') : 'not checked yet';
+}
+
+function nextStep(row) {
+  const a = row.apple || {};
+  const owner = OWNER[row.slug] || row.name;
+  const st = a.current && a.current.state;
+  const newer = a.newestBuild && a.current && a.current.build && String(a.newestBuild) !== String(a.current.build.version) ? a.newestBuild : null;
+  const has = (re) => row.reds.some((x) => re.test(x));
+  if (st === 'WAITING_FOR_REVIEW' || st === 'IN_REVIEW') {
+    return 'in review as ' + a.current.version + ' — wait for Apple' + (newer ? '; build ' + newer + ' waits for your yes on a number' : '');
+  }
+  if (st === 'READY_FOR_SALE') {
+    if (newer) return 'live ' + (a.live ? a.live.version : a.current.version) + ' — build ' + newer + ' waits for your yes on a number';
+    return 'live on both stores, nothing missing';
+  }
+  if (has(/Play: no (512 icon|feature graphic|phone screenshots)/)) {
+    return 'your yes on the Play artwork' + (row.artReady ? ' — it is made and measured' : '') + '; then I upload it and attach the build';
+  }
+  if (has(/no build attached/)) return 'attach build ' + (a.newestBuild || '') + ' to ' + (a.current ? a.current.version : 'the version');
+  if (has(/Apple: (keywords|description|support URL|privacy policy|no primary category|age rating)/)) return 'fill the missing App Store field, then attach the build';
+  if (has(/Xcode Cloud: not connected/)) return '5 clicks in Xcode connect Xcode Cloud, then a build runs on main';
+  if (newer) return 'build ' + newer + ' waits for your yes on a version number';
+  const amber65 = ambers(row).find((o) => /^6\.5/.test(o.label));
+  if (amber65) return 'your call on the 6.5" screenshots — finish the set or remove it';
+  if (has(/Play: production track empty/)) return 'promote a build to Play production after your yes';
+  if (has(/GitHub: \d+ files not committed/)) {
+    const m = row.reds.find((x) => /GitHub: \d+ files/.test(x));
+    return owner + ' commits and pushes — ' + m.replace('GitHub: ', '');
+  }
+  return 'nothing missing';
+}
+
+function readGoal(dir) {
+  try {
+    const f = path.join(dir, 'GOAL.md');
+    if (!fs.existsSync(f)) return null;
+    const t = fs.readFileSync(f, 'utf8');
+    const pick = (re) => { const m = t.match(re); return m ? m[1].replace(/\*\*/g, '').trim() : null; };
+    const g = {
+      target: pick(/^\*\*Target:\*\*\s*(.+)$/m),
+      done: pick(/^\*\*Done looks like:\*\*\s*(.+)$/m),
+      now: pick(/^\*\*Now \([^)]*\):\*\*\s*(.+)$/m),
+      updated: pick(/^\*\*Updated:\*\*\s*(.+)$/m),
+    };
+    return (g.target || g.done) ? g : null;
+  } catch (e) { return null; }
+}
+
+function renderPage(payload) {
+  const rows = [...payload.apps].sort((a, b) => b.reds.length - a.reds.length);
+  const totalRed = rows.reduce((n, r) => n + r.reds.length, 0);
+  const totalAmber = rows.reduce((n, r) => n + ambers(r).length, 0);
+  const g = loadGates();
+  const checked = fmtChicago(new Date(payload.generatedAt));
+
+  const cards = rows.map((r) => {
+    const a = r.apple || {};
+    const vline = (a.current ? a.current.version + ' · ' + stateWord(a.current.state) : 'no version') + (a.live && (!a.current || a.live.version !== a.current.version) ? ' · live ' + a.live.version : '');
+    const redItems = r.reds.map((t) => {
+      const [label, text] = redParts(t);
+      return '<p class="item"><span class="dot dr"></span><span><span class="r">' + esc(label) + '</span> — ' + esc(text) + '</span></p>';
+    });
+    const amberItems = ambers(r).map((o) =>
+      '<p class="item"><span class="dot da"></span><span><span class="a">' + esc(o.label) + '</span> — ' + esc(o.text) + '</span></p>');
+    const body = redItems.length || amberItems.length
+      ? redItems.join('') + amberItems.join('')
+      : '<p class="item"><span class="dot dg"></span><span><span class="g">Nothing missing</span></span></p>';
+    const goal = readGoal(APP_DIR[r.slug] || '');
+    const goalHtml = goal ? '\n      <p class="goalline"><span class="gl">Goal</span>' + esc(goal.target || goal.done) + '</p>' : '';
+    return '<div class="mlist">\n      <div class="mhead"><img src="icons/' + r.slug + '.png" alt=""><div>\n' +
+      '        <div class="nm">' + esc(r.name) + '</div><div class="ver">' + esc(vline) + '</div>\n' +
+      '        <div class="own">Owner: ' + esc(OWNER[r.slug] || r.name) + '</div></div></div>\n      ' + body +
+      goalHtml +
+      '\n      <p class="nextline"><span class="nx">Next</span>' + esc(nextStep(r)) + '</p>\n    </div>';
+  }).join('\n');
+
+  const doneRows = rows.map((r) =>
+    '<tr><td><div class="appcell"><img src="icons/' + r.slug + '.png" alt=""><div><div class="nm">' + esc(r.name) +
+    '</div><div class="ver">' + esc(r.apple && r.apple.current ? r.apple.current.version : 'no version') + '</div></div></div></td>' +
+    '<td><div class="green">' + inPlace(r) + '</div></td></tr>').join('\n');
+
+  const gv = Object.entries(g.version || {});
+  const logHtml = readLog(10).map((l) => {
+    const i = l.indexOf(' · ');
+    return '<div><span>' + esc(i > 0 ? l.slice(0, i) : '') + '</span> — ' + esc(i > 0 ? l.slice(i + 3) : l) + '</div>';
+  }).join('\n      ') || '<div><span>—</span> — no run logged yet</div>';
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta http-equiv="refresh" content="300">
+<title>Four apps — what is missing</title>
+<style>
+  :root{ --ink:#f2f4f6; --muted:#a8b0ba; --line:#3d4249; --bg:#24272b; --card:#2c3036;
+         --red:#ff8078; --amber:#ffc857; --green:#63df9d; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);padding:30px 20px 50px;
+       font:17.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+       font-weight:500;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1280px;margin:0 auto}
+  h1{font-size:32px;margin:0 0 6px;letter-spacing:-.02em;font-weight:800}
+  .stamp{color:var(--muted);font-size:14.5px;font-weight:650;margin:0 0 16px}
+  .bar{height:6px;border-radius:99px;margin:0 0 22px;
+       background:linear-gradient(90deg,#2ee6a8,#22d3ee 16%,#ffd447 34%,#ff9e3d 48%,#ff3d6e 62%,#ff3d7f 76%,#c22bff)}
+  h2{font-size:15px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+     margin:30px 2px 12px;font-weight:800}
+  h2:first-of-type{margin-top:4px}
+  .count{color:var(--red);font-weight:800}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+  .mlist{background:var(--card);border-radius:16px;padding:16px 18px;border:1px solid var(--line)}
+  .mhead{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+  .mhead img{width:44px;height:44px;border-radius:11px;border:1px solid #4a515a}
+  .nm{font-weight:800;font-size:18px;line-height:1.15}
+  .ver{color:var(--muted);font-size:13.5px;font-weight:650}
+  .own{color:#cfd6de;font-size:13px;font-weight:700;margin-top:2px}
+  .item{display:flex;gap:10px;align-items:baseline;margin:0 0 7px;font-size:16.5px;font-weight:600}
+  .item:last-child{margin-bottom:0}
+  .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto;transform:translateY(-1px)}
+  .dr{background:#ff6f66} .da{background:#ffc857} .dg{background:#63df9d}
+  .r{color:var(--red);font-weight:800} .a{color:var(--amber);font-weight:800} .g{color:var(--green);font-weight:800}
+  .goalline{background:#1e2a3a;border-radius:12px;padding:10px 13px;margin:12px 0 0;font-size:16.5px;font-weight:700;line-height:1.35;color:#e8f1ff;border-left:5px solid #5aa9ff}
+  .goalline .gl{display:inline-block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;color:#0b2239;background:#5aa9ff;border-radius:99px;padding:2px 8px;margin-right:7px;transform:translateY(-2px)}
+  .nextline{background:#1f3a2c;border-radius:12px;padding:10px 13px;margin:12px 0 0;font-size:16.5px;font-weight:700;line-height:1.35;color:#eefbf3;border-left:5px solid #63df9d}
+  .nextline .nx{display:inline-block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;color:#0d2d1c;background:#63df9d;border-radius:99px;padding:2px 8px;margin-right:7px;transform:translateY(-2px)}
+  .note{color:var(--muted);font-size:14px;font-weight:600;margin:9px 0 0}
+  .scroll{background:var(--card);border-radius:16px;overflow-x:auto;border:1px solid var(--line)}
+  table{border-collapse:collapse;width:100%;min-width:820px}
+  thead th{font-size:12.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+           font-weight:800;text-align:left;padding:14px 18px 10px;border-bottom:1px solid var(--line);background:#31363c}
+  tbody td{padding:16px 18px;border-bottom:1px solid var(--line);vertical-align:middle}
+  tbody tr:last-child td{border-bottom:0}
+  .appcell{display:flex;align-items:center;gap:12px;min-width:230px}
+  .appcell img{width:42px;height:42px;border-radius:10px;border:1px solid #4a515a}
+  .appcell .nm{font-size:16.5px}
+  .green{color:#dde3ea;font-size:15.5px;line-height:1.6;font-weight:600}
+  .green b{color:var(--green);font-weight:800}
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .box{background:var(--card);border-radius:16px;padding:16px 18px;border:1px solid var(--line)}
+  .box h3{font-size:17px;margin:0 0 10px;font-weight:800}
+  .box ol,.box ul{margin:0;padding-left:22px;font-size:16px;font-weight:600}
+  .box li{margin:6px 0}
+  .log{font-size:15px;font-weight:600;color:#dde3ea}
+  .log div{margin:4px 0}
+  .log span{color:var(--muted);font-weight:700}
+  .foot{color:var(--muted);font-size:14px;font-weight:600;margin-top:18px}
+  .pagetab{display:inline-block;background:#343a42;border:1px solid #6b7684;color:#eef3f8;text-decoration:none;font-size:17.5px;font-weight:800;padding:14px 24px;border-radius:14px}
+  .pagetab:hover{background:#3f4650;border-color:#8b97a6}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div style="margin:0 0 20px"><a class="pagetab" href="file:///Users/nakfaai/output/projects/status.html">Projects · hintza · salsa · books &#8594;</a> <a class="pagetab" href="file:///Users/nakfaai/output/apps/evidence.html">Owner evidence · what each Bot proved &#8594;</a></div>
+  <h1>What is missing, app by app</h1>
+  <p class="stamp">Checked ${esc(checked)} America/Chicago · Apple API, Google Play API, Xcode Cloud API, folders on the Mac</p>
+  <div class="bar"></div>
+
+  <h2>Missing now — <span class="count">${totalRed} block the store</span> · ${totalAmber} one thing short</h2>
+  <div class="grid">
+${cards}
+  </div>
+
+  <h2>Already in place</h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>App</th><th>Done</th></tr></thead>
+    <tbody>
+${doneRows}
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Who does what</h2>
+  <div class="twocol">
+    <div class="box">
+      <h3>Team</h3>
+      <ul>
+        <li>App Manager — the store side, this page, the twice-daily checks.</li>
+        <li>Kalkidan, Pixwee, netbrew, GeezEsay — code and artwork for their own app.</li>
+        <li>Go Live — the live presses, when Ammaniel says go.</li>
+        <li>Tester, Tester 2 — run the app and verify on device.</li>
+        <li>Marketing Geezeasy — social, not the stores.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Your three gates</h3>
+      <ol>
+        <li>An upload to Apple or Play — your yes, every time.</li>
+        <li>A version or build number — your yes on that exact number.</li>
+        <li>Submit or Resubmit — only your click.</li>
+      </ol>
+      <p class="note">Recorded version yes: ${gv.length ? esc(gv.map(([k, v]) => k + ' → ' + v).join(', ')) : 'none'} · this tool refuses any other number.</p>
+    </div>
+  </div>
+
+  <h2>Run log</h2>
+  <div class="log">
+      ${logHtml}
+  </div>
+
+  <p class="foot">Red = blocks the store, amber = one thing short. Not read by any API: Play content rating and data safety (Play Console only). Page written by <b>apps-status</b> at every run.</p>
+</div>
+</body>
+</html>
+`;
+  fs.mkdirSync(path.dirname(PAGE_FILE), { recursive: true });
+  fs.writeFileSync(PAGE_FILE, html);
+  return PAGE_FILE;
+}
+
+async function main() {
+  const g = loadGates();
+  if (VERB === 'gates') {
+    if (args[1] === 'set') {
+      const [, , kind, key, value] = args;
+      if (!['version', 'submit', 'spend'].includes(kind)) die('kind must be version|submit|spend');
+      const cur = loadGates();
+      if (kind === 'version') { cur.version = cur.version || {}; cur.version[key] = value; }
+      if (kind === 'submit') cur.submit = { key, at: new Date().toISOString() };
+      if (kind === 'spend') { cur.spend = cur.spend || []; cur.spend.push(key); }
+      fs.mkdirSync(STATE, { recursive: true });
+      fs.writeFileSync(GATE_FILE, JSON.stringify(cur, null, 2));
+      appendLog(`GATE ${kind} ${key}${value ? ' ' + value : ''} recorded`);
+      console.log(`GATE SET ${kind} ${key} ${value}`);
+      return;
+    }
+    if (args[1] === 'clear') {
+      const kind = args[2], key = args[3];
+      const cur = loadGates();
+      if (kind === 'version') { if (key) delete cur.version[key]; else cur.version = {}; }
+      else if (kind === 'submit') cur.submit = null;
+      else if (kind === 'spend') cur.spend = key ? (cur.spend || []).filter((x) => x !== key) : [];
+      else die('kind must be version|submit|spend');
+      fs.mkdirSync(STATE, { recursive: true });
+      fs.writeFileSync(GATE_FILE, JSON.stringify(cur, null, 2));
+      appendLog(`GATE ${kind} ${key || ''} cleared`.replace(/\s+/g, ' '));
+      console.log(`GATE CLEARED ${kind} ${key || ''}`.replace(/\s+/g, ' '));
+      return;
+    }
+    console.log(JSON.stringify(g, null, 2));
+    return;
+  }
+
+  // page: render the last JSON, no network
+  if (VERB === 'page') {
+    const p = safeJson(OUT_FILE);
+    if (!p) die('no state yet — run apps-status first');
+    console.log('page → ' + renderPage(p) + '  (from state ' + p.generatedAt + ')');
+    return;
+  }
+
+  // writes: delegate to storeship, in the app's folder, and print the exact call
+  const STORESHIP_VERBS = ['state', 'listing', 'privacy', 'category', 'age', 'rights', 'pricing', 'review', 'shots', 'build', 'upload', 'attach', 'testflight', 'validate', 'play-init', 'play-listing', 'play-shots', 'play-bundle', 'play-track', 'play-notes', 'init'];
+  if (STORESHIP_VERBS.includes(VERB)) {
+    const slug = args[1];
+    const app = APPS.find((a) => a.slug === slug);
+    if (!app) die('unknown app: ' + slug + ' (use ' + APPS.map((a) => a.slug).join(', ') + ')');
+    if (VERB === 'state' || VERB === 'validate') assertGate('none', '', '');
+    const rest = args.slice(2);
+    const cmd = [STORESHIP, VERB, ...rest];
+    writeCall(`cd ${app.dir} && ASC_BUNDLE=${app.bundleId} PLAY_PACKAGE=${app.playPackage} ${cmd.join(' ')}`);
+    const r = spawnSync(STORESHIP, [VERB, ...rest], {
+      cwd: app.dir,
+      stdio: 'inherit',
+      env: { ...process.env, ASC_BUNDLE: app.bundleId, PLAY_PACKAGE: app.playPackage },
+    });
+    process.exit(r.status ?? 0);
+  }
+
+  // refusal verbs — these are never run by this tool
+  if (VERB === 'version' || VERB === 'bump') {
+    const slug = args[1], num = args[2];
+    assertGate('version', slug, num);
+    die('this tool has no version-bump path: change the number in the project by hand, after the gate says yes.');
+  }
+  if (VERB === 'submit' || VERB === 'resubmit') {
+    assertGate('submit', args[1], '');
+    die('this tool never submits. Submit stays Ammaniel\'s click in App Store Connect.');
+  }
+  if (VERB === 'spend') { assertGate('spend', args[1], ''); die('no money-moving code exists here.'); }
+
+  const onlySlug = VERB === 'one' ? args[1] : null;
+  const wantJson = VERB === 'json';
+  const targets = onlySlug ? APPS.filter((a) => a.slug === onlySlug) : APPS;
+  if (onlySlug && !targets.length) die('unknown app: ' + onlySlug);
+
+  const rows = [];
+  for (const app of targets) rows.push(await readApp(app));
+  const prev = safeJson(OUT_FILE);
+  let apps = rows;
+  if (onlySlug && prev && Array.isArray(prev.apps)) {
+    apps = rows.concat(prev.apps.filter((a) => a.slug !== onlySlug));
+  }
+  const order = new Map(APPS.map((a, i) => [a.slug, i]));
+  apps.sort((a, b) => (order.get(a.slug) ?? 99) - (order.get(b.slug) ?? 99));
+  const payload = { generatedAt: new Date().toISOString(), apps };
+  fs.mkdirSync(STATE, { recursive: true });
+  fs.writeFileSync(OUT_FILE, JSON.stringify(payload, null, 2));
+  if (wantJson) { console.log(JSON.stringify(payload, null, 2)); return; }
+
+  logRun(prev, rows);
+  const pagePath = renderPage(payload);
+
+  console.log(`\nALL FOUR APPS — checked ${new Date().toLocaleString('en-US', { timeZone: 'America/Chicago' })} (America/Chicago)\n`);
+  for (const row of rows.sort((a, b) => b.reds.length - a.reds.length)) console.log(line(row));
+  console.log('');
+  for (const row of rows) {
+    const head = `${icon(row)} ${row.name}`;
+    if (!row.reds.length && !row.notes.length) { console.log(head + ' — nothing red.'); continue; }
+    console.log(head);
+    for (const r of row.reds) console.log('   🔴 ' + r);
+    for (const n of row.notes) console.log('   ⚪ ' + n);
+  }
+  const total = rows.reduce((n, r) => n + r.reds.length, 0);
+  console.log(`\n${total} red${total === 1 ? '' : 's'} across ${rows.length} apps · state → ${OUT_FILE}`);
+  console.log('gates → ' + (fs.existsSync(GATE_FILE) ? JSON.stringify(loadGates()) : 'none set'));
+  console.log('page  → ' + pagePath);
+}
+
+main().catch((e) => die(e.message));

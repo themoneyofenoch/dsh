@@ -1,0 +1,697 @@
+#!/usr/bin/env node
+// ship.mjs — one command line from "app is done" to "App Store only waits for your click".
+//
+//   node scripts/ship.mjs state                    what Apple sees right now
+//   node scripts/ship.mjs listing [--dry]          fill text metadata from ship.json
+//   node scripts/ship.mjs privacy                  privacy policy + support URL
+//   node scripts/ship.mjs category                 primary category + age rating
+//   node scripts/ship.mjs shots <dir> [--type=X]   upload screenshots (sorted by name)
+//   node scripts/ship.mjs validate                 Apple's own validation, read the result
+//
+// It never submits for review. Submit stays a human click.
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+const KEY_ID = process.env.ASC_KEY_ID || 'DASF43QDRT';
+const ISSUER = process.env.ASC_ISSUER || '0418454e-4e54-4fc7-a387-b3b2460fd5e8';
+const KEY_PATH = process.env.ASC_KEY || `${process.env.HOME}/Developer/private_keys/AuthKey_${KEY_ID}.p8`;
+const confFile = process.env.SHIP_CONF || path.join(process.cwd(), 'ship.json');
+const confSeed = fs.existsSync(confFile) ? JSON.parse(fs.readFileSync(confFile, 'utf8')) : {};
+const BUNDLE = process.env.ASC_BUNDLE || confSeed.bundleId || '';
+if (!BUNDLE) {
+  console.error('\u2717 no app named here: ' + confFile + ' has no bundleId and ASC_BUNDLE is unset.');
+  console.error('  Run it in the app folder whose ship.json has bundleId, or pass ASC_BUNDLE=com.your.app. It never guesses an app.');
+  process.exit(2);
+}
+const API = 'https://api.appstoreconnect.apple.com';
+const KEY = fs.readFileSync(KEY_PATH, 'utf8');
+const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const confPath = confFile; void root;
+
+const b64 = (b) => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function token() {
+  const n = Math.floor(Date.now() / 1000);
+  const h = b64(JSON.stringify({ alg: 'ES256', kid: KEY_ID, typ: 'JWT' }));
+  const p = b64(JSON.stringify({ iss: ISSUER, iat: n, exp: n + 900, aud: 'appstoreconnect-v1' }));
+  const i = h + '.' + p;
+  return i + '.' + b64(crypto.sign('sha256', Buffer.from(i), { key: KEY, dsaEncoding: 'ieee-p1363' }));
+}
+
+async function api(method, p, body) {
+  const r = await fetch(API + p, {
+    method,
+    headers: { Authorization: 'Bearer ' + token(), 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await r.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text.slice(0, 400) }; }
+  if (!r.ok) {
+    const errs = (json && json.errors) || [];
+    throw new Error(`${method} ${p} -> ${r.status} ${errs.map((e) => e.title + ': ' + (e.detail || '')).join(' | ') || text.slice(0, 200)}`);
+  }
+  return json;
+}
+
+async function pageAll(p) {
+  let out = [];
+  let next = p;
+  while (next) {
+    const j = await api('GET', next);
+    out = out.concat(j.data || []);
+    const n = j.links && j.links.next;
+    next = n ? n.replace(API, '') : null;
+  }
+  return out;
+}
+
+async function ctx() {
+  const apps = await api('GET', `/v1/apps?filter[bundleId]=${encodeURIComponent(BUNDLE)}`);
+  const app = (apps.data || [])[0];
+  if (!app) throw new Error('no app for bundle ' + BUNDLE);
+  const versions = await api('GET', `/v1/apps/${app.id}/appStoreVersions?limit=5`);
+  const editable = (versions.data || []).find((v) => v.attributes.appStoreState === 'PREPARE_FOR_SUBMISSION') || versions.data[0];
+  const infos = await api('GET', `/v1/apps/${app.id}/appInfos?limit=5&include=primaryCategory,secondaryCategory`);
+  const info = (infos.data || []).find((i) => i.attributes.appStoreState === 'PREPARE_FOR_SUBMISSION') || infos.data[0];
+  return { app, version: editable, info, versions: versions.data || [] };
+}
+
+async function localization(versionId, locale = 'en-US') {
+  const ls = await api('GET', `/v1/appStoreVersions/${versionId}/appStoreVersionLocalizations?limit=50`);
+  return (ls.data || []).find((l) => l.attributes.locale === locale) || (ls.data || [])[0];
+}
+
+async function infoLocalization(infoId, locale = 'en-US') {
+  const ls = await api('GET', `/v1/appInfos/${infoId}/appInfoLocalizations?limit=50`);
+  return (ls.data || []).find((l) => l.attributes.locale === locale) || (ls.data || [])[0];
+}
+
+function loadConf() {
+  if (!fs.existsSync(confPath)) throw new Error('ship.json missing at ' + confPath);
+  return JSON.parse(fs.readFileSync(confPath, 'utf8'));
+}
+
+const cmd = process.argv[2] || 'state';
+const arg = process.argv[3];
+const has = (f) => process.argv.includes(f);
+const flag = (name, def) => {
+  const hit = process.argv.find((a) => a.startsWith('--' + name + '='));
+  return hit ? hit.slice(name.length + 3) : def;
+};
+
+async function state() {
+  const { app, version, info, versions } = await ctx();
+  console.log('app        ', app.attributes.name, app.id);
+  console.log('bundle     ', app.attributes.bundleId);
+  const truthIl = info ? await infoLocalization(info.id) : null;
+  console.log('privacyUrl ', (truthIl && truthIl.attributes.privacyPolicyUrl) || 'NONE');
+  console.log('sku        ', app.attributes.sku);
+  console.log('versions   ', versions.map((v) => v.attributes.versionString + '=' + v.attributes.appStoreState).join(', '));
+  console.log('editable   ', version.attributes.versionString, version.attributes.appStoreState);
+  if (info) {
+    const il = await infoLocalization(info.id);
+    const pcId = info.relationships?.primaryCategory?.data?.id || 'NONE';
+    const scId = info.relationships?.secondaryCategory?.data?.id || 'NONE';
+    console.log('info       ', 'state=' + info.attributes.appStoreState, 'primaryCat=' + pcId, 'secondaryCat=' + scId);
+    if (il) console.log('name/sub   ', JSON.stringify(il.attributes.name), '/', JSON.stringify(il.attributes.subtitle));
+  }
+  const loc = await localization(version.id);
+  if (loc) {
+    const a = loc.attributes;
+    console.log('locale     ', a.locale);
+    console.log('promo      ', (a.promoText || '').length, 'chars');
+    console.log('keywords   ', JSON.stringify(a.keywords || ''));
+    console.log('description', (a.description || '').length, 'chars');
+    console.log('supportUrl ', a.supportUrl || 'NONE');
+    console.log('marketing  ', a.marketingUrl || 'NONE');
+    const sets = await api('GET', `/v1/appStoreVersionLocalizations/${loc.id}/appScreenshotSets?limit=50`);
+    for (const s of sets.data || []) {
+      const shots = await api('GET', `/v1/appScreenshotSets/${s.id}/appScreenshots?limit=50`);
+      console.log('shots      ', s.attributes.screenshotDisplayType, (shots.data || []).length);
+    }
+    const previews = await api('GET', `/v1/appStoreVersionLocalizations/${loc.id}/appStoreVersionExperiments?limit=10`).catch(() => null);
+    void previews;
+  }
+  const builds = await api('GET', `/v1/builds?filter[app]=${app.id}&limit=5&sort=-uploadedDate`);
+  for (const b of builds.data || []) console.log('build      ', b.attributes.version, b.attributes.processingState, b.attributes.uploadedDate);
+}
+
+async function listing() {
+  const conf = loadConf();
+  const dry = has('--dry');
+  const { version, info } = await ctx();
+  if (!version || version.attributes.appStoreState !== 'PREPARE_FOR_SUBMISSION') throw new Error('version is not editable: ' + (version && version.attributes.appStoreState));
+  const loc = await localization(version.id);
+  if (!loc) throw new Error('no en-US localization on version');
+  const attrs = {
+    description: conf.description,
+    keywords: conf.keywords,
+    supportUrl: conf.supportUrl,
+    marketingUrl: conf.marketingUrl,
+    promotionalText: conf.promotionalText,
+  };
+  for (const [k, v] of Object.entries(attrs)) if (typeof v === 'string' && v.length > 4000) throw new Error(k + ' too long: ' + v.length);
+  console.log('listing ->', Object.entries(attrs).map(([k, v]) => `${k}:${(v || '').length}`).join(' '));
+  if (dry) return console.log('dry run, nothing written');
+  await api('PATCH', `/v1/appStoreVersionLocalizations/${loc.id}`, { data: { type: 'appStoreVersionLocalizations', id: loc.id, attributes: attrs } });
+  console.log('listing written');
+  if (info && conf.subtitle) {
+    const il = await infoLocalization(info.id);
+    if (il) {
+      const a = {};
+      if (conf.appName) a.name = conf.appName;
+      a.subtitle = conf.subtitle.slice(0, 30);
+      a.privacyPolicyUrl = conf.privacyUrl;
+      if (conf.privacyChoicesUrl) a.privacyChoicesUrl = conf.privacyChoicesUrl;
+      await api('PATCH', `/v1/appInfoLocalizations/${il.id}`, { data: { type: 'appInfoLocalizations', id: il.id, attributes: a } });
+      console.log('app info written', JSON.stringify(a).slice(0, 120));
+    }
+  }
+}
+
+async function privacy() {
+  const conf = loadConf();
+  const { info } = await ctx();
+  if (info) {
+    const il = await infoLocalization(info.id);
+    if (il) await api('PATCH', `/v1/appInfoLocalizations/${il.id}`, { data: { type: 'appInfoLocalizations', id: il.id, attributes: { privacyPolicyUrl: conf.privacyUrl } } });
+  }
+  console.log('privacyUrl ->', conf.privacyUrl);
+}
+
+async function category() {
+  const conf = loadConf();
+  const { info } = await ctx();
+  const cats = await pageAll('/v1/appCategories?limit=200');
+  const norm = (n) => String(n).toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '');
+  const byName = (n) => (cats.find((c) => c.id === norm(n) || (c.attributes && c.attributes.name && c.attributes.name.toLowerCase() === String(n).toLowerCase())) || {}).id;
+  const primary = byName(conf.primaryCategory);
+  if (!primary) throw new Error('unknown category ' + conf.primaryCategory + ' — have: ' + cats.slice(0, 8).map((c) => c.attributes.name).join(', '));
+  const body = { data: { type: 'appInfos', id: info.id, relationships: { primaryCategory: { data: { type: 'appCategories', id: primary } } } } };
+  const secondary = conf.secondaryCategory ? byName(conf.secondaryCategory) : null;
+  if (secondary) body.data.relationships.secondaryCategory = { data: { type: 'appCategories', id: secondary } };
+  await api('PATCH', `/v1/appInfos/${info.id}`, body);
+  console.log('category ->', conf.primaryCategory, secondary ? '+ ' + conf.secondaryCategory : '');
+}
+
+async function ensureSet(locId, type) {
+  const sets = await api('GET', `/v1/appStoreVersionLocalizations/${locId}/appScreenshotSets?limit=50`);
+  const found = (sets.data || []).find((s) => s.attributes.screenshotDisplayType === type);
+  if (found) return found;
+  const made = await api('POST', '/v1/appScreenshotSets', {
+    data: { type: 'appScreenshotSets', attributes: { screenshotDisplayType: type }, relationships: { appStoreVersionLocalization: { data: { type: 'appStoreVersionLocalizations', id: locId } } } },
+  });
+  return made.data;
+}
+
+async function shots() {
+  if (!arg) throw new Error('usage: shots <dir> [--type=APP_IPHONE_67]');
+  const typeArg = (process.argv.find((a) => a.startsWith('--type=')) || '').split('=')[1];
+  const type = typeArg || 'APP_IPHONE_67';
+  const dir = path.resolve(arg);
+  const files = fs.readdirSync(dir).filter((f) => /\.(png|jpg|jpeg)$/i.test(f)).sort();
+  if (!files.length) throw new Error('no images in ' + dir);
+  const { version } = await ctx();
+  const loc = await localization(version.id);
+  const set = await ensureSet(loc.id, type);
+  console.log('set', set.id, type, 'files', files.length);
+  const existing = await api('GET', `/v1/appScreenshotSets/${set.id}/appScreenshots?limit=50`);
+  for (const s of existing.data || []) await api('DELETE', `/v1/appScreenshots/${s.id}`).catch((e) => console.log('  del skip', e.message.slice(0, 60)));
+  const ids = [];
+  for (const f of files) {
+    const created = await api('POST', '/v1/appScreenshots', {
+      data: { type: 'appScreenshots', attributes: { fileName: f, fileSize: fs.statSync(path.join(dir, f)).size }, relationships: { appScreenshotSet: { data: { type: 'appScreenshotSets', id: set.id } } } },
+    });
+    const id = created.data.id;
+    const ops = created.data.attributes.uploadOperations || [];
+    const buf = fs.readFileSync(path.join(dir, f));
+    for (const op of ops) {
+      const headers = {};
+      for (const h of op.requestHeaders || []) headers[h.name] = h.value;
+      const r = await fetch(op.url, { method: op.method, headers, body: buf.subarray(op.offset, op.offset + op.length) });
+      if (!r.ok) throw new Error('upload part failed ' + r.status + ' ' + f);
+    }
+    await api('PATCH', `/v1/appScreenshots/${id}`, { data: { type: 'appScreenshots', id, attributes: { uploaded: true } } });
+    ids.push(id);
+    console.log(' uploaded', f);
+  }
+  console.log('screenshots done', ids.length);
+}
+
+async function validate() {
+  const { version } = await ctx();
+  const r = await fetch(`${API}/v1/appStoreVersions/${version.id}/appStoreVersionSubmissions`, { headers: { Authorization: 'Bearer ' + token() } });
+  void r;
+  const check = await api('POST', '/v1/appStoreVersionValidations', {
+    data: { type: 'appStoreVersionValidations', attributes: { platform: 'IOS' }, relationships: { appStoreVersion: { data: { type: 'appStoreVersions', id: version.id } } } },
+  }).catch((e) => ({ error: e.message }));
+  if (check.error) return console.log('validate:', check.error);
+  console.log('validation started', check.data && check.data.id);
+}
+
+
+async function attach() {
+  const want = arg || null;
+  const { app, version } = await ctx();
+  const builds = await api('GET', `/v1/builds?filter[app]=${app.id}&limit=20&sort=-uploadedDate`);
+  const valid = (builds.data || []).filter((b) => b.attributes.processingState === 'VALID' || b.attributes.processingState === 'PROCESSING');
+  const pick = want ? valid.find((b) => b.attributes.version === String(want)) : valid[0];
+  if (!pick) throw new Error('no build' + (want ? ' ' + want : '') + ' — have ' + valid.map((b) => b.attributes.version).join(','));
+  await api('PATCH', `/v1/appStoreVersions/${version.id}`, { data: { type: 'appStoreVersions', id: version.id, relationships: { build: { data: { type: 'builds', id: pick.id } } } } });
+  console.log('attached build', pick.attributes.version, pick.attributes.processingState);
+}
+
+async function age() {
+  const { info } = await ctx();
+  const decl = await api('GET', `/v1/appInfos/${info.id}/ageRatingDeclaration`);
+  const id = decl.data.id;
+  // Apple only allows UPDATE on this resource, so the whole descriptor set goes in one shot.
+  const INTENSITY = ['profanityOrCrudeHumor', 'violenceCartoonOrFantasy', 'alcoholTobaccoOrDrugUseOrReferences', 'violenceRealistic', 'medicalOrTreatmentInformation', 'sexualContentGraphicAndNudity', 'matureOrSuggestiveThemes', 'sexualContentOrNudity', 'horrorOrFearThemes', 'gunsOrOtherWeapons', 'gamblingSimulated', 'violenceRealisticProlongedGraphicOrSadistic'];
+  const FLAGS = ['messagingAndChat', 'unrestrictedWebAccess', 'gambling', 'contests', 'healthOrWellnessTopics', 'parentalControls', 'advertising', 'ageAssurance', 'userGeneratedContent', 'lootBox'];
+  const attrs = {};
+  for (const f of INTENSITY) attrs[f] = 'NONE';
+  for (const f of FLAGS) attrs[f] = false;
+  // honest for Netbrew: members write their own profile and chat with each other
+  attrs.messagingAndChat = true;
+  attrs.userGeneratedContent = true;
+  await api('PATCH', `/v1/ageRatingDeclarations/${id}`, { data: { type: 'ageRatingDeclarations', id, attributes: attrs } });
+  console.log('age rating set: all explicit content None, chat + member content declared');
+}
+
+async function pricing() {
+  const { app } = await ctx();
+  const price = await api('GET', `/v1/apps/${app.id}/appPriceSchedule`).catch((e) => ({ error: e.message }));
+  console.log('price schedule:', price.data ? 'present' : (price.error || 'none'));
+  const avail = await api('GET', `/v1/apps/${app.id}/appAvailability`).catch((e) => ({ error: e.message }));
+  console.log('availability:', avail.data ? 'present' : (avail.error || 'none'));
+}
+
+
+async function build() {
+  const { execSync } = await import('node:child_process');
+  const scheme = arg || confSeed.scheme || 'Netbrew';
+  const ws = (confSeed.workspace || `ios/${scheme}.xcworkspace`);
+  const archive = '/tmp/storeship/app.xcarchive';
+  const exportDir = '/tmp/storeship/export';
+  fs.mkdirSync('/tmp/storeship', { recursive: true });
+  const team = confSeed.teamId || '';
+  console.log('archive', ws, scheme, 'team', team || '(from project)');
+  execSync(`xcodebuild -workspace ${ws} -scheme ${scheme} -configuration Release -destination 'generic/platform=iOS' -archivePath ${archive} ${team ? 'DEVELOPMENT_TEAM=' + team : ''} -allowProvisioningUpdates archive`, { stdio: 'inherit' });
+  const opts = { method: 'app-store', signingStyle: 'automatic', uploadSymbols: true };
+  if (team) opts.teamID = team;
+  fs.writeFileSync('/tmp/storeship/export-options.plist', plist(opts));
+  execSync(`xcodebuild -exportArchive -archivePath ${archive} -exportPath ${exportDir} -exportOptionsPlist /tmp/storeship/export-options.plist -allowProvisioningUpdates`, { stdio: 'inherit' });
+  const ipa = fs.readdirSync(exportDir).find((f) => f.endsWith('.ipa'));
+  console.log('ipa', path.join(exportDir, ipa || '(none)'));
+}
+
+function plist(o) {
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>${Object.entries(o).map(([k, v]) => `<key>${k}</key>${typeof v === 'boolean' ? (v ? '<true/>' : '<false/>') : `<string>${v}</string>`}`).join('')}</dict></plist>`;
+}
+
+async function upload() {
+  const ipa = arg || '/tmp/storeship/export/Netbrew.ipa';
+  if (!fs.existsSync(ipa)) throw new Error('no ipa at ' + ipa);
+  const { execSync } = await import('node:child_process');
+  execSync(`xcrun altool --upload-app -f "${ipa}" --type ios --apiKey ${KEY_ID} --apiIssuer ${ISSUER}`, { stdio: 'inherit' });
+  console.log('uploaded — Apple processes it for a few minutes, then: attach');
+}
+
+async function testflight() {
+  const { app } = await ctx();
+  const builds = await api('GET', `/v1/builds?filter[app]=${app.id}&limit=5&sort=-uploadedDate`);
+  const b = (builds.data || [])[0];
+  if (!b) throw new Error('no build yet');
+  const groups = await api('GET', `/v1/betaGroups?filter[app]=${app.id}&limit=20`);
+  let ext = (groups.data || []).find((g) => !g.attributes.isInternalGroup);
+  if (!ext) {
+    const made = await api('POST', '/v1/betaGroups', { data: { type: 'betaGroups', attributes: { name: 'Public testers', publicLinkEnabled: true, publicLinkLimitEnabled: false }, relationships: { app: { data: { type: 'apps', id: app.id } } } } });
+    ext = made.data;
+  }
+  await api('POST', `/v1/betaGroups/${ext.id}/relationships/builds`, { data: [{ type: 'builds', id: b.id }] });
+  await api('PATCH', `/v1/betaGroups/${ext.id}`, { data: { type: 'betaGroups', id: ext.id, attributes: { publicLinkEnabled: true, publicLinkLimitEnabled: false } } });
+  console.log('build', b.attributes.version, 'on tester group', ext.attributes.publicLink || '(link appears after beta review)');
+}
+
+
+// ── Google Play (androidpublisher v3, service account) ──────────────────────────────
+const PLAY_KEY = process.env.GOOGLE_PLAY_KEY || path.join(process.env.HOME, 'Developer/private_keys/google-play-key.json');
+const PLAY_PKG = process.env.PLAY_PACKAGE || confSeed.packageName || 'com.silki.app';
+async function playToken() {
+  const sa = JSON.parse(fs.readFileSync(PLAY_KEY, 'utf8'));
+  const now = Math.floor(Date.now() / 1000);
+  const b64 = (b) => Buffer.from(b).toString('base64url');
+  const head = b64(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const body = b64(JSON.stringify({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/androidpublisher', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
+  const sig = (await import('node:crypto')).createSign('RSA-SHA256').update(head + '.' + body).sign(sa.private_key, 'base64url');
+  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=' + head + '.' + body + '.' + sig });
+  const j = await r.json();
+  if (!j.access_token) throw new Error('play token: ' + JSON.stringify(j).slice(0, 200));
+  return j.access_token;
+}
+const playApi = async (method, url, body, tok) => {
+  const r = await fetch('https://androidpublisher.googleapis.com/androidpublisher/v3' + url, {
+    method, headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined,
+  });
+  const t = await r.text();
+  return [r.status, t ? JSON.parse(t) : {}];
+};
+async function playOpen() {
+  const tok = await playToken();
+  const [s, j] = await playApi('POST', `/applications/${PLAY_PKG}/edits`, null, tok);
+  if (s !== 200) throw new Error('open edit: ' + s + ' ' + JSON.stringify(j).slice(0, 200));
+  return { tok, edit: j.id };
+}
+const playClose = async (tok, edit, commit) => {
+  if (commit) await playApi('POST', `/applications/${PLAY_PKG}/edits/${edit}:commit`, null, tok);
+  else await playApi('DELETE', `/applications/${PLAY_PKG}/edits/${edit}`, null, tok);
+};
+
+async function playState() {
+  const tok = await playToken();
+  const [s, j] = await playApi('POST', `/applications/${PLAY_PKG}/edits`, null, tok);
+  if (s !== 200) { console.log('app', PLAY_PKG, 'not found in Play (400/404 = create it in the Console UI)'); return; }
+  const [ts, tr] = await playApi('GET', `/applications/${PLAY_PKG}/edits/${j.id}/tracks`, null, tok);
+  (tr.tracks || []).forEach((t) => console.log('track', t.track, (t.releases || []).map((r) => r.versionCodes + ' ' + r.status).join(', ')));
+  const [ls, l] = await playApi('GET', `/applications/${PLAY_PKG}/edits/${j.id}/listings`, null, tok);
+  (l.listings || []).forEach((x) => console.log('listing', x.language, '|', x.title, '|', (x.shortDescription || '').slice(0, 40)));
+  await playApi('DELETE', `/applications/${PLAY_PKG}/edits/${j.id}`, null, tok);
+}
+
+async function playBundle() {
+  const aab = arg;
+  if (!aab || !fs.existsSync(aab)) throw new Error('need an .aab path');
+  const { tok, edit } = await playOpen();
+  const r = await fetch(`https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/${PLAY_PKG}/edits/${edit}/bundles?uploadType=media`, { method: 'POST', headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/octet-stream' }, body: fs.readFileSync(aab) });
+  const j = await r.json();
+  console.log('bundle', r.status, 'versionCode', j.versionCode);
+  const [ts] = await playApi('PUT', `/applications/${PLAY_PKG}/edits/${edit}/tracks/internal`, { track: 'internal', releases: [{ status: 'completed', versionCodes: [String(j.versionCode)] }] }, tok);
+  console.log('internal track', ts === 200 ? 'released' : 'failed ' + ts);
+  await playClose(tok, edit, ts === 200);
+}
+
+const playGet = async (url, tok) => {
+  const [s, j] = await playApi('GET', url, null, tok);
+  if (s !== 200) throw new Error('GET ' + url + ' -> ' + s + ' ' + JSON.stringify(j).slice(0, 200));
+  return j;
+};
+const playSend = async (method, url, body, tok) => {
+  const [s, j] = await playApi(method, url, body, tok);
+  if (s !== 200) throw new Error(method + ' ' + url + ' -> ' + s + ' ' + JSON.stringify(j).slice(0, 300));
+  return j;
+};
+
+// App details: default language + the contact block Play shows on the store page.
+async function playInit() {
+  const conf = loadConf();
+  const email = conf.contactEmail || conf.reviewEmail;
+  const phone = conf.contactPhone || conf.reviewPhone;
+  const site = conf.contactWebsite || conf.marketingUrl;
+  const details = {
+    defaultLanguage: conf.playDefaultLanguage || 'en-US',
+    ...(email ? { contactEmail: email } : {}),
+    ...(phone ? { contactPhone: phone } : {}),
+    ...(site ? { contactWebsite: site } : {}),
+  };
+  if (!details.contactEmail) throw new Error('ship.json needs contactEmail or reviewEmail');
+  console.log('details ->', JSON.stringify(details));
+  if (has('--dry')) return console.log('dry run, nothing written');
+  const { tok, edit } = await playOpen();
+  try {
+    const current = await playGet(`/applications/${PLAY_PKG}/edits/${edit}/details`, tok).catch(() => null);
+    if (current) console.log('current   ', JSON.stringify({ defaultLanguage: current.defaultLanguage, contactEmail: current.contactEmail }));
+    await playSend('PUT', `/applications/${PLAY_PKG}/edits/${edit}/details`, details, tok);
+    await playClose(tok, edit, true);
+    console.log('app details written');
+  } catch (e) {
+    await playClose(tok, edit, false);
+    throw e;
+  }
+}
+
+// Store listing text. --show reads what Play has; otherwise writes from ship.json.
+async function playListing() {
+  const language = flag('lang', 'en-US');
+  if (has('--show')) {
+    const { tok, edit } = await playOpen();
+    const j = await playGet(`/applications/${PLAY_PKG}/edits/${edit}/listings/${language}`, tok);
+    console.log('language ', j.language);
+    console.log('title    ', JSON.stringify(j.title), (j.title || '').length, '/30');
+    console.log('short    ', JSON.stringify(j.shortDescription), (j.shortDescription || '').length, '/80');
+    console.log('full     ', (j.fullDescription || '').length, '/4000 chars');
+    console.log('video    ', j.video || 'NONE');
+    await playClose(tok, edit, false);
+    return;
+  }
+  const conf = loadConf();
+  const body = {
+    language,
+    title: (conf.playTitle || conf.appName || '').slice(0, 30),
+    shortDescription: (conf.playShort || conf.subtitle || '').slice(0, 80),
+    fullDescription: (conf.playFull || conf.description || '').slice(0, 4000),
+  };
+  if (conf.playVideo) body.video = conf.playVideo;
+  if (!body.title || !body.fullDescription) throw new Error('ship.json needs appName/playTitle and description/playFull');
+  console.log('listing  ->', language, JSON.stringify(body.title), body.shortDescription.length, '/80', body.fullDescription.length, '/4000');
+  if (has('--dry')) return console.log('dry run, nothing written');
+  const { tok, edit } = await playOpen();
+  try {
+    await playSend('PUT', `/applications/${PLAY_PKG}/edits/${edit}/listings/${language}`, body, tok);
+    await playClose(tok, edit, true);
+    console.log('listing written');
+  } catch (e) {
+    await playClose(tok, edit, false);
+    throw e;
+  }
+}
+
+// Store images: icon, featureGraphic, phoneScreenshots, sevenInchScreenshots, tenInchScreenshots, tvBanner…
+async function playShots() {
+  if (!arg) throw new Error('usage: play-shots <dir> [--type=phoneScreenshots] [--lang=en-US] [--dry]');
+  const type = flag('type', 'phoneScreenshots');
+  const language = flag('lang', 'en-US');
+  const dir = path.resolve(arg);
+  const files = fs.readdirSync(dir).filter((f) => /\.(png|jpg|jpeg)$/i.test(f)).sort();
+  if (!files.length) throw new Error('no images in ' + dir);
+  if (type === 'phoneScreenshots' && files.length < 2) throw new Error('Play needs at least 2 phone screenshots');
+  console.log('type', type, 'lang', language, 'files', files.length);
+  for (const f of files) console.log(' ', f, Math.round(fs.statSync(path.join(dir, f)).size / 1024) + 'KB');
+  if (has('--dry')) return console.log('dry run, nothing uploaded');
+  const { tok, edit } = await playOpen();
+  try {
+    const [cleared] = await playApi('DELETE', `/applications/${PLAY_PKG}/edits/${edit}/listings/${language}/${type}`, null, tok);
+    console.log('cleared old', type, cleared);
+    for (const f of files) {
+      const mime = /\.png$/i.test(f) ? 'image/png' : 'image/jpeg';
+      const r = await fetch(`https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/${PLAY_PKG}/edits/${edit}/listings/${language}/${type}?uploadType=media`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + tok, 'Content-Type': mime },
+        body: fs.readFileSync(path.join(dir, f)),
+      });
+      const t = await r.text();
+      if (!r.ok) throw new Error('upload failed ' + f + ' ' + r.status + ' ' + t.slice(0, 300));
+      console.log(' uploaded', f);
+    }
+    await playClose(tok, edit, true);
+    console.log('images written', files.length);
+  } catch (e) {
+    await playClose(tok, edit, false);
+    throw e;
+  }
+}
+
+async function playTrackShow() {
+  const tok = await playToken();
+  const [s, j] = await playApi('POST', `/applications/${PLAY_PKG}/edits`, null, tok);
+  if (s !== 200) throw new Error('open edit: ' + s + ' ' + JSON.stringify(j).slice(0, 200));
+  const tr = await playGet(`/applications/${PLAY_PKG}/edits/${j.id}/tracks`, tok);
+  for (const t of tr.tracks || []) {
+    const rel = (t.releases || []).map((r) => [r.status, r.versionCodes && r.versionCodes.join(','), r.userFraction ? Math.round(r.userFraction * 100) + '%' : ''].filter(Boolean).join(' ')).join(' | ');
+    console.log('track', t.track.padEnd(12), rel || '(empty)');
+  }
+  await playApi('DELETE', `/applications/${PLAY_PKG}/edits/${j.id}`, null, tok);
+}
+
+// Releases: put version codes on a track. Production stays a draft until Ammaniel says --publish.
+async function playTrack() {
+  const track = arg;
+  if (!track || track === 'list' || has('--show')) return playTrackShow();
+  const codes = process.argv.slice(4).filter((a) => /^\d+$/.test(a));
+  if (!codes.length) throw new Error('need version codes (the number play-bundle printed), e.g. play-track internal 42');
+  const status = flag('status', track === 'production' ? 'draft' : 'completed');
+  const rollout = flag('rollout');
+  const notesFile = flag('notes');
+  const language = flag('lang', 'en-US');
+  const isProd = track === 'production';
+  if (isProd && status !== 'draft' && !has('--publish')) {
+    throw new Error('production release is Ammaniel\'s click — status draft is safe; pass --publish only on his explicit word');
+  }
+  const release = { status, versionCodes: codes.map(String) };
+  const relName = flag('name');
+  if (relName) release.name = relName;
+  if (rollout) release.userFraction = Math.max(0, Math.min(100, Number(rollout))) / 100;
+  if (notesFile) {
+    if (!fs.existsSync(notesFile)) throw new Error('no notes file at ' + notesFile);
+    release.releaseNotes = [{ language, text: fs.readFileSync(notesFile, 'utf8').trim().slice(0, 500) }];
+  }
+  console.log('track    ', track, 'status', status, 'codes', codes.join(','), rollout ? 'rollout ' + rollout + '%' : '');
+  console.log('release  ', JSON.stringify(release).slice(0, 300));
+  if (has('--dry')) return console.log('dry run, nothing written');
+  const { tok, edit } = await playOpen();
+  try {
+    await playSend('PUT', `/applications/${PLAY_PKG}/edits/${edit}/tracks/${track}`, { track, releases: [release] }, tok);
+    await playClose(tok, edit, true);
+    console.log('track written', track, status);
+  } catch (e) {
+    await playClose(tok, edit, false);
+    throw e;
+  }
+}
+
+// Release notes for the release already on a track (Play shows these on the store).
+async function playNotes() {
+  const track = arg;
+  const file = process.argv[4];
+  if (!track || !file) throw new Error('usage: play-notes <track> <file.txt> [--lang=en-US] [--dry]');
+  if (!fs.existsSync(file)) throw new Error('no notes file at ' + file);
+  const language = flag('lang', 'en-US');
+  const isProd = track === 'production';
+  if (isProd && !has('--publish')) throw new Error('production edit is Ammaniel\'s click — pass --publish only on his explicit word');
+  const text = fs.readFileSync(file, 'utf8').trim().slice(0, 500);
+  console.log('notes    ', track, language, text.length, '/500 chars');
+  if (has('--dry')) return console.log('dry run, nothing written');
+  const { tok, edit } = await playOpen();
+  try {
+    const current = await playGet(`/applications/${PLAY_PKG}/edits/${edit}/tracks/${track}`, tok);
+    const release = (current.releases || [])[0];
+    if (!release) throw new Error('no release on ' + track + ' — run play-track first');
+    release.releaseNotes = [{ language, text }];
+    await playSend('PUT', `/applications/${PLAY_PKG}/edits/${edit}/tracks/${track}`, { track, releases: [release] }, tok);
+    await playClose(tok, edit, true);
+    console.log('release notes written');
+  } catch (e) {
+    await playClose(tok, edit, false);
+    throw e;
+  }
+}
+
+async function init() {
+  const conf = loadConf();
+  if (!conf.bundleId || !conf.appName || !conf.sku) throw new Error('ship.json needs bundleId, appName and sku');
+  let bid = null;
+  const ids = await api('GET', `/v1/bundleIds?filter[identifier]=${encodeURIComponent(conf.bundleId)}&limit=5`);
+  bid = (ids.data || [])[0];
+  if (!bid) {
+    const made = await api('POST', '/v1/bundleIds', { data: { type: 'bundleIds', attributes: { identifier: conf.bundleId, name: conf.appName.replace(/[^A-Za-z0-9 ]/g, ''), platform: 'IOS', seedId: conf.teamId } } });
+    bid = made.data;
+    console.log('bundle id created', conf.bundleId);
+  } else console.log('bundle id exists', conf.bundleId);
+  const apps = await api('GET', `/v1/apps?filter[bundleId]=${encodeURIComponent(conf.bundleId)}`);
+  if ((apps.data || []).length) return console.log('app record exists', apps.data[0].id);
+  const created = await api('POST', '/v1/apps', { data: { type: 'apps', attributes: { bundleId: conf.bundleId, name: conf.appName, primaryLocale: 'en-US', sku: conf.sku, contentRightsDeclaration: 'USES_THIRD_PARTY_CONTENT' }, relationships: { bundleId: { data: { type: 'bundleIds', id: bid.id } } } } });
+  console.log('app record created', created.data.id);
+  const ver = await api('POST', '/v1/appStoreVersions', { data: { type: 'appStoreVersions', attributes: { platform: 'IOS', versionString: conf.version || '1.0' }, relationships: { app: { data: { type: 'apps', id: created.data.id } } } } });
+  console.log('version created', ver.data.attributes.versionString);
+  await api('POST', '/v1/appStoreVersionLocalizations', { data: { type: 'appStoreVersionLocalizations', attributes: { locale: 'en-US' }, relationships: { appStoreVersion: { data: { type: 'appStoreVersions', id: ver.data.id } } } } });
+  console.log('en-US localization created — run: listing, category, age, shots, attach, rights');
+}
+
+async function rights() {
+  const { app } = await ctx();
+  const value = process.env.CONTENT_RIGHTS || 'USES_THIRD_PARTY_CONTENT';
+  await api('PATCH', `/v1/apps/${app.id}`, { data: { type: 'apps', id: app.id, attributes: { contentRightsDeclaration: value } } });
+  console.log('content rights ->', value);
+}
+
+async function review() {
+  const conf = loadConf();
+  const { version } = await ctx();
+  const attrs = {
+    contactFirstName: conf.reviewFirstName,
+    contactLastName: conf.reviewLastName,
+    contactEmail: conf.reviewEmail,
+    contactPhone: conf.reviewPhone,
+    demoAccountRequired: false,
+    notes: conf.reviewNotes,
+  };
+  const existing = await api('GET', `/v1/appStoreVersions/${version.id}/appStoreReviewDetail`).catch(() => null);
+  const id = existing && existing.data && existing.data.id;
+  if (id) {
+    await api('PATCH', `/v1/appStoreReviewDetails/${id}`, { data: { type: 'appStoreReviewDetails', id, attributes: attrs } });
+    console.log('review detail updated');
+  } else {
+    await api('POST', '/v1/appStoreReviewDetails', {
+      data: { type: 'appStoreReviewDetails', attributes: attrs, relationships: { appStoreVersion: { data: { type: 'appStoreVersions', id: version.id } } } },
+    });
+    console.log('review detail created');
+  }
+}
+
+
+// link — put this app's Android build on the one test-builds page every app shares.
+//   link [--apk <path>] [--notes "one line"] [--notes-file f] [--name "App name"]
+//        [--host https://builds.nakfaai.com] [--dry] [--no-push]
+async function link() {
+  const { execSync } = await import('node:child_process');
+  const conf = loadConf();
+  const DIR = process.env.LINKS_DIR || `${process.env.HOME}/Developer/projects/builds`;
+  const REPO = process.env.LINKS_REPO || `${process.env.HOME}/Developer/projects/nakfaai`;
+  const HOST = flag('host', 'https://builds.nakfaai.com').replace(/\/$/, '');
+  const dry = has('--dry');
+  const apkArg = flag('apk');
+  const pkg = JSON.parse(fs.existsSync('app.json') ? fs.readFileSync('app.json', 'utf8') : '{}');
+  const version = flag('version', (pkg.expo && pkg.expo.version) || conf.version || '1.0');
+  const pkgName = fs.existsSync('package.json') ? (JSON.parse(fs.readFileSync('package.json', 'utf8')).name || '') : '';
+  const slug = flag('app', conf.slug || (conf.appName || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || pkgName || path.basename(process.cwd()));
+  const name = flag('name', conf.appName || slug.charAt(0).toUpperCase() + slug.slice(1));
+  let apk = apkArg;
+  if (!apk) {
+    for (const guess of ['android/app/build/outputs/apk/release/app-release.apk', ...fs.readdirSync('builds', { withFileTypes: false }).filter((f) => f.endsWith('.apk')).map((f) => path.join('builds', f))]) {
+      if (fs.existsSync(guess)) { apk = guess; break; }
+    }
+  }
+  if (!apk || !fs.existsSync(apk)) throw new Error('no APK found — build one (cd android && ./gradlew assembleRelease) or pass --apk <path>');
+  const file = `${slug}-${version}-${new Date().toISOString().slice(0, 10)}.apk`;
+  const destDir = path.join(DIR, 'public', slug);
+  const dest = path.join(destDir, file);
+  const url = `${HOST}/${slug}/${file}`;
+  const notes = flag('notes', fs.existsSync(flag('notes-file', '')) ? fs.readFileSync(flag('notes-file'), 'utf8').trim() : '');
+  console.log(`${dry ? 'DRY ' : ''}apk   ${apk} (${(fs.statSync(apk).size / 1048576).toFixed(0)} MB)`);
+  console.log(`${dry ? 'DRY ' : ''}copy  ${dest}`);
+  console.log(`${dry ? 'DRY ' : ''}url   ${url}`);
+  if (dry) return;
+  fs.mkdirSync(destDir, { recursive: true });
+  fs.copyFileSync(apk, dest);
+  execSync('firebase deploy --only hosting:builds --project netbrew-b3fdc', { cwd: DIR, stdio: 'inherit' });
+  const appsFile = path.join(REPO, 'builds', 'apps.json');
+  const data = JSON.parse(fs.readFileSync(appsFile, 'utf8'));
+  const list = data.apps || (data.apps = []);
+  let entry = list.find((a) => a.id === slug);
+  if (!entry) { entry = { id: slug, name, tagline: '', icon: '', version: '', built: '', notes: '', android: '', ios: '' }; list.push(entry); }
+  entry.name = flag('name', entry.name || name);
+  entry.version = version;
+  entry.built = new Date().toISOString().slice(0, 10);
+  entry.android = url;
+  if (notes) entry.notes = notes;
+  data.updated = entry.built;
+  fs.writeFileSync(appsFile, JSON.stringify(data, null, 2) + '\n');
+  execSync(`git add builds/apps.json && git commit -q -m "builds: ${entry.name} ${version} android" && git push -q origin main`, { cwd: REPO, stdio: 'inherit' });
+  console.log(`live  ${url}`);
+  console.log(`page  ${HOST.replace(/builds\./, '')}/builds`);
+}
+
+const commands = {
+  state, init, listing, privacy, category, age, rights, pricing, review, shots, build, upload, attach, testflight, validate,
+  'play-state': playState, 'play-init': playInit, 'play-listing': playListing, 'play-shots': playShots,
+  'play-bundle': playBundle, 'play-track': playTrack, 'play-notes': playNotes,
+  link,
+};
+if (!commands[cmd]) {
+  console.log('commands: ' + Object.keys(commands).join(', '));
+  process.exit(1);
+}
+commands[cmd]().catch((e) => {
+  console.error('FAIL', e.message);
+  process.exit(1);
+});

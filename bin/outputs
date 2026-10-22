@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Build one local page listing every file the Bots delivered.
+
+Usage: outputs [--open] [--root DIR] [--quiet]
+
+Scans ROOT (default /Users/nakfaai/output), newest first, and writes
+ROOT/index.html: a self-contained page with search, filter chips and
+picture previews taken straight from the existing files.
+
+Nothing is installed, nothing is copied, no server, no internet.
+A LaunchAgent (com.nakfaai.output-index) runs this every 5 minutes.
+"""
+import argparse
+import html
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+
+ROOT_DEFAULT = "/Users/nakfaai/output"
+INDEX_NAME = "index.html"
+SKIP_DIRS = {".thumbs", ".git", "node_modules"}
+IMAGE_EXT = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "svg"}
+VIDEO_EXT = {"mp4", "mov", "m4v", "webm"}
+DOC_EXT = {"pdf", "docx", "xlsx", "pptx", "doc", "xls", "ppt", "pages"}
+DATA_EXT = {"json", "yml", "yaml", "csv", "xml"}
+LOG_EXT = {"log", "txt", "md"}
+
+KIND_LABEL = {
+    "picture": "Pictures",
+    "video": "Video",
+    "document": "Documents",
+    "data": "Data",
+    "log": "Notes & logs",
+    "other": "Everything",
+}
+
+
+def kind_of(ext):
+    if ext in IMAGE_EXT:
+        return "picture"
+    if ext in VIDEO_EXT:
+        return "video"
+    if ext in DOC_EXT:
+        return "document"
+    if ext in DATA_EXT:
+        return "data"
+    if ext in LOG_EXT:
+        return "log"
+    return "other"
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return "%d B" % n
+
+
+def load_folder_titles(folder_path):
+    """Optional .index.json in a folder: {"file.png": {"title": "...", "bot": "..."}}"""
+    p = os.path.join(folder_path, ".index.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def collect(root):
+    rows = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS)
+        titles = load_folder_titles(dirpath)
+        for name in filenames:
+            if name.startswith("."):
+                continue
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            if os.path.abspath(full) == os.path.abspath(os.path.join(root, INDEX_NAME)):
+                continue
+            rel = os.path.relpath(full, root)
+            ext = os.path.splitext(name)[1].lstrip(".").lower()
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            parts = rel.split(os.sep)
+            folder = parts[0] if len(parts) > 1 else "root"
+            meta = titles.get(name) or {}
+            rows.append({
+                "rel": rel,
+                "abs": os.path.abspath(full),
+                "dir": dirpath,
+                "name": name,
+                "folder": folder,
+                "title": meta.get("title") or os.path.splitext(name)[0],
+                "bot": meta.get("bot") or "",
+                "kind": kind_of(ext),
+                "ext": ext,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            })
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+CSS = """
+:root{--ink:#111;--soft:#6b6b6b;--line:#e6e6e6;--bg:#fffdf8;--hi:#fff0d6;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+ font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--bg);
+ border-bottom:1px solid var(--line);padding:18px 22px 12px}
+h1{margin:0 0 2px;font-size:24px;font-weight:700;letter-spacing:-.2px}
+.sub{color:var(--soft);font-size:13px;margin-bottom:14px}
+.search{width:100%;max-width:520px;padding:11px 14px;font-size:16px;
+ border:1px solid var(--line);border-radius:12px;background:#fff;color:var(--ink);outline:none}
+.search:focus{border-color:#bbb}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.chip{border:1px solid var(--line);background:#fff;color:var(--ink);padding:7px 13px;
+ border-radius:999px;font-size:14px;cursor:pointer}
+.chip.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+main{padding:20px 22px 60px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--soft);
+ margin:26px 0 12px;font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px}
+figure{margin:0;background:#fff;border:1px solid var(--line);border-radius:14px;
+ overflow:hidden;cursor:pointer}
+figure:hover{border-color:#ccc}
+figure img{display:block;width:100%;height:180px;object-fit:cover;background:#f4f1ea}
+figcaption{padding:9px 11px 11px;font-size:13px}
+figcaption b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;
+ text-overflow:ellipsis}
+figcaption span{color:var(--soft);font-size:12px}
+.row{display:flex;align-items:baseline;gap:12px;padding:11px 12px;background:#fff;
+ border:1px solid var(--line);border-radius:12px;margin-bottom:8px;cursor:pointer}
+.row:hover{border-color:#ccc}
+.row .badge{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);
+ min-width:74px}
+.row .nm{font-weight:600;word-break:break-all}
+.row .mt{color:var(--soft);font-size:12px;margin-left:auto;white-space:nowrap}
+.pick{font:inherit;font-size:15px;line-height:1;border:1px solid var(--line);background:#fff;
+ color:var(--ink);border-radius:9px;padding:6px 8px;cursor:pointer}
+.pick:hover{border-color:#bbb;background:var(--hi)}
+.pick.done{background:#e8f8ef;border-color:#9ad9b4}
+figure .pick{position:absolute;top:8px;right:8px;z-index:2;background:#ffffffe6}
+figure{position:relative}
+a.open{display:block}
+.folders{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
+.folders .fl{display:flex;align-items:center;gap:6px;border:1px solid var(--line);
+ background:#fff;border-radius:999px;padding:4px 6px 4px 12px;font-size:13px}
+.folders .fl a{color:var(--ink);text-decoration:none}
+.folders .fl a:hover{text-decoration:underline}
+.empty{color:var(--soft);padding:40px 4px}
+footer{color:var(--soft);font-size:12px;padding:0 22px 40px}
+"""
+
+JS = """
+(function(){
+ var q=document.getElementById('q'), chips=[].slice.call(document.querySelectorAll('.chip')),
+     items=[].slice.call(document.querySelectorAll('[data-kind]')), empty=document.getElementById('empty'),
+     kind='picture';
+ function apply(){
+   var t=q.value.trim().toLowerCase(), shown=0;
+   items.forEach(function(el){
+     var okKind = (kind==='all') || (el.dataset.kind===kind) ||
+                  (kind==='document' && el.dataset.kind==='log');
+     var hay=(el.dataset.name+' '+el.dataset.folder).toLowerCase();
+     var okText=t===''||hay.indexOf(t)>=0;
+     var on=okKind&&okText; el.style.display=on?'':'none'; if(on)shown++;
+   });
+   chips.forEach(function(c){c.classList.toggle('on',c.dataset.kind===kind)});
+   empty.style.display=shown?'none':'block';
+ }
+ chips.forEach(function(c){c.addEventListener('click',function(){kind=c.dataset.kind;apply()})});
+ q.addEventListener('input',apply);
+ apply();
+
+ // 📁 button -> local helper opens Finder at that file or folder.
+ var REVEAL='http://127.0.0.1:7799/reveal?p=';
+ document.addEventListener('click',function(ev){
+   var b=ev.target.closest?ev.target.closest('.pick'):null;
+   if(!b)return;
+   ev.preventDefault(); ev.stopPropagation();
+   var p=b.dataset.path;
+   if(!p){b.title='No path on this item';return;}
+   var probe=new Image();
+   probe.onload=probe.onerror=function(){
+     b.classList.add('done');
+     b.textContent='✓';
+     setTimeout(function(){b.classList.remove('done');b.textContent='📁'},1200);
+   };
+   probe.src=REVEAL+encodeURIComponent(p)+'&t='+Date.now();
+ });
+})();
+"""
+
+
+def render(rows, root):
+    by_kind = {"picture": 0, "video": 0, "document": 0, "data": 0, "log": 0, "other": 0}
+    for r in rows:
+        by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
+    total_size = sum(r["size"] for r in rows)
+    newest = rows[0]["mtime"] if rows else time.time()
+
+    out = []
+    out.append("<!doctype html>")
+    out.append('<html lang="en"><head><meta charset="utf-8">')
+    out.append('<meta name="viewport" content="width=device-width,initial-scale=1">')
+    out.append('<title>Every file the Bots made</title><style>%s</style></head>' % CSS)
+    out.append("<body><header>")
+    out.append("<h1>Every file the Bots made</h1>")
+    out.append('<div class="sub">%d files &middot; %s &middot; newest %s &middot; '
+               'rebuilt %s</div>' % (
+                   len(rows), human_size(total_size),
+                   time.strftime("%a %d %b, %H:%M", time.localtime(newest)),
+                   time.strftime("%a %d %b %Y, %H:%M", time.localtime())))
+    out.append('<input id="q" class="search" type="search" '
+               'placeholder="Search a name or a folder...">')
+    out.append('<div class="chips">')
+    chips = [("picture", "Pictures (%d)" % by_kind["picture"]),
+             ("document", "Documents (%d)" % (by_kind["document"] + by_kind["log"])),
+             ("video", "Video (%d)" % by_kind["video"]),
+             ("data", "Data (%d)" % by_kind["data"]),
+             ("all", "Everything (%d)" % len(rows))]
+    for key, label in chips:
+        out.append('<button class="chip" data-kind="%s">%s</button>' % (key, html.escape(label)))
+    out.append("</div>")
+
+    # One chip per folder: the name opens the folder in Safari, 📁 opens Finder.
+    folders = {}
+    for r in rows:
+        folders.setdefault(r["folder"], r["dir"])
+    if folders:
+        out.append('<div class="folders"><span class="sub" style="margin:0">Folders:</span>')
+        for name in sorted(folders, key=str.lower):
+            furi = "file://" + urllib.parse.quote(folders[name], safe="/") + "/"
+            out.append('<span class="fl"><a href="%s" target="_blank" rel="noopener">%s</a>'
+                       '<button class="pick" type="button" title="Show this folder in Finder" '
+                       'data-path="%s">&#128193;</button></span>' % (
+                           html.escape(furi, quote=True), html.escape(name),
+                           html.escape(folders[name], quote=True)))
+        out.append("</div>")
+
+    out.append("</header><main>")
+
+    def href(r):
+        return "file://" + urllib.parse.quote(r["abs"], safe="/")
+
+    for kind in ("picture", "video", "document", "data", "log", "other"):
+        group = [r for r in rows if r["kind"] == kind]
+        if not group:
+            continue
+        out.append("<h2>%s &middot; %d</h2>" % (KIND_LABEL[kind], len(group)))
+        if kind in ("picture", "video"):
+            out.append('<div class="grid">')
+            for r in group:
+                caption = ("%s &middot; %s" % (html.escape(r["folder"]), human_size(r["size"])))
+                if r["bot"]:
+                    caption += " &middot; " + html.escape(r["bot"])
+                out.append(
+                    '<figure data-kind="%s" data-name="%s" data-folder="%s">'
+                    '<button class="pick" type="button" title="Show in Finder" data-path="%s">'
+                    '&#128193;</button>'
+                    '<a class="open" href="%s" target="_blank" rel="noopener">'
+                    '<img loading="lazy" src="%s" alt="%s"></a>'
+                    '<figcaption><b>%s</b><span>%s</span></figcaption></figure>' % (
+                        r["kind"], html.escape(r["name"]), html.escape(r["folder"]),
+                        html.escape(r["abs"], quote=True), html.escape(href(r), quote=True),
+                        urllib.parse.quote(r["rel"], safe="/"), html.escape(r["name"]),
+                        html.escape(r["title"]), caption))
+            out.append("</div>")
+        else:
+            for r in group:
+                when = time.strftime("%d %b %H:%M", time.localtime(r["mtime"]))
+                out.append(
+                    '<div class="row" data-kind="%s" data-name="%s" data-folder="%s">'
+                    '<span class="badge">%s</span>'
+                    '<a href="%s" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">'
+                    '<span class="nm">%s</span></a>'
+                    '<span class="mt">%s &middot; %s</span>'
+                    '<button class="pick" type="button" title="Show in Finder" data-path="%s">'
+                    '&#128193;</button></div>' % (
+                        r["kind"], html.escape(r["name"]), html.escape(r["folder"]),
+                        html.escape(r["ext"] or "file"),
+                        html.escape(href(r), quote=True), html.escape(r["title"]),
+                        html.escape(when), human_size(r["size"]),
+                        html.escape(r["abs"], quote=True)))
+        out.append('<p id="empty" class="empty" style="display:none">'
+                   'Nothing here for this filter.</p>')
+
+    out.append("</main><footer>Built in %s by <code>~/.dsh/bin/outputs</code>. "
+               "A Bot copies each file here, so the sidebar link opens.</footer>" % html.escape(root))
+    out.append("<script>%s</script></body></html>" % JS)
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--open", action="store_true")
+    ap.add_argument("--root", default=ROOT_DEFAULT)
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+
+    root = os.path.abspath(a.root)
+    if not os.path.isdir(root):
+        sys.stderr.write("no such folder: %s\n" % root)
+        return 2
+
+    rows = collect(root)
+    page = render(rows, root)
+    target = os.path.join(root, INDEX_NAME)
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(page)
+    os.replace(tmp, target)
+
+    if not a.quiet:
+        print("indexed %d files -> %s (%d bytes)" % (len(rows), target, len(page.encode())))
+    if a.open:
+        subprocess.call(["open", "-a", "Safari", target])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

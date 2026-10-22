@@ -1,0 +1,93 @@
+#!/bin/bash
+# settings-push — snapshot Ammaniel's DSH setup into the settings git repo and push it.
+# Secrets, chat sessions, logs and node_modules never leave this Mac.
+set -euo pipefail
+
+DSH="/Users/nakfaai/.dsh"
+REPO="/Users/nakfaai/Developer/projects/deepseek-harness"
+S="$REPO/settings"
+DRY=0
+[ "${1:-}" = "--dry" ] && DRY=1
+
+[ -d "$REPO/.git" ] || { echo "repo missing: $REPO"; exit 1; }
+mkdir -p "$S/bin" "$S/profile"
+
+# 1. top-level docs
+for f in AGENTS.md persona.md DESIGN.md SAFARI-CONTROL.md lessons.md STRUCTURE.md FOCUS.md SESSION.md math-snippets.json; do
+  [ -f "$DSH/$f" ] && cp "$DSH/$f" "$S/$f"
+done
+
+# 2. skills and bin tools
+rsync -a --delete "$DSH/skills/" "$S/skills/"
+cp "$DSH/bin/storeship" "$S/bin/storeship"
+cp "$DSH/bin/safari" "$S/bin/safari"
+
+# 3. profile config
+cp "$DSH/profiles/desktop/cordis.patch.yml" "$S/profile/cordis.patch.yml"
+cp "$DSH/profiles/desktop/package.json" "$S/profile/desktop-package.json"
+
+# 4. Bots, rooms, prefs — exported from the live team file, no secrets
+python3 - "$S" <<'PY'
+import json, sys, datetime
+S = sys.argv[1]
+state = json.load(open('/Users/nakfaai/.dsh/bot/state.json'))
+bots = state['bots']
+mains = set(state.get('mainBotIds') or [])
+out = []
+for bid, b in bots.items():
+    out.append({
+        'name': b.get('name'), 'role': b.get('role') or '', 'color': b.get('color'),
+        'model': b.get('model'), 'effort': b.get('effort'),
+        'appliedModel': b.get('appliedModel'), 'appliedEffort': b.get('appliedEffort'),
+        'workDir': b.get('workDir'), 'permission': b.get('permission'),
+        'instructions': b.get('instructions') or '',
+        'capabilities': [c.get('name') if isinstance(c, dict) else c for c in (b.get('capabilities') or [])],
+        'hidden': b.get('hidden'), 'pinned': b.get('pinned'),
+        'createdAt': b.get('createdAt'), 'createdBy': b.get('createdBy'),
+        'isMain': bid in mains,
+    })
+out.sort(key=lambda x: (not x['isMain'], (x['name'] or '').lower()))
+json.dump(out, open(f'{S}/bots.json', 'w'), indent=1, ensure_ascii=False)
+
+rooms = []
+for rid, r in state['rooms'].items():
+    rooms.append({
+        'name': r.get('name'), 'mode': r.get('mode'), 'notice': r.get('notice') or '',
+        'members': r.get('members') or [], 'admin': r.get('admin'),
+        'workDir': r.get('workDir'), 'permission': r.get('permission'),
+        'pinned': r.get('pinned'), 'createdAt': r.get('createdAt'),
+    })
+json.dump(rooms, open(f'{S}/rooms.json', 'w'), indent=1, ensure_ascii=False)
+json.dump(state.get('prefs') or {}, open(f'{S}/prefs.json', 'w'), indent=1, ensure_ascii=False)
+print(f"exported {len(out)} bots, {len(rooms)} rooms")
+PY
+
+# 5. README date + counts
+python3 - "$S" <<'PY'
+import json, re, sys, datetime
+S = sys.argv[1]
+bots = json.load(open(f'{S}/bots.json')); rooms = json.load(open(f'{S}/rooms.json'))
+now = datetime.date.today().isoformat()
+p = f'{S}/README.md'
+t = open(p).read()
+t = re.sub(r'Taken \d{4}-\d{2}-\d{2}', f'Taken {now}', t, count=1)
+t = re.sub(r'all \d+ Bots', f'all {len(bots)} Bots', t, count=1)
+t = re.sub(r'the \d+ group chats', f'the {len(rooms)} group chats', t, count=1)
+open(p, 'w').write(t)
+PY
+
+if [ "$DRY" = "1" ]; then
+  echo "--- dry run, changes ---"
+  git -C "$REPO" status --short
+  exit 0
+fi
+
+git -C "$REPO" add -A
+if git -C "$REPO" diff --cached --quiet; then
+  echo "nothing changed since the last push"
+  exit 0
+fi
+git -C "$REPO" -c user.name="DSH Settings" -c user.email="settings@nakfaai.local" \
+  commit -q -m "settings: sync $(date '+%Y-%m-%d %H:%M')"
+git -C "$REPO" push -q origin master
+echo "pushed: $(git -C "$REPO" log --oneline -1)"

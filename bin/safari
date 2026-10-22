@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""dsh safari — drive the user's REAL Safari (AppleScript + do JavaScript).
+
+Usage:
+  safari tabs                       list every tab (* marks THIS BOT's tab)
+  safari whoami                     which Bot you are, and who is holding Safari
+  safari open URL [--new]           open URL: reuse THIS BOT's tab, or make one — never the user's
+  safari focus [--match SUBSTR]     focus the Bot tab and wait for it to load
+  safari text  [--match SUBSTR]     page innerText (first 6000 chars)
+  safari map   [--match SUBSTR]     JSON: url, title, text head, clickable controls
+  safari click --index N | --text S | --aria S   [--match SUBSTR]
+  safari type  --index N VALUE | --aria S VALUE  [--match SUBSTR]
+  safari fill  --file RECIPE.json | --json '{...}'  [--match SUBSTR] [--dry-run]
+  safari js    CODE | --file F      [--match SUBSTR]
+  safari shot  OUT.png [--match SUBSTR]   screenshot the Safari window
+  safari wait  SECONDS
+
+TABS ARE PER BOT. Each Bot owns its own tab slot: a tab is marked `dsh-bot-tab:<bot>`,
+the state file keeps one entry per Bot, and another Bot's tab is not yours to drive.
+One Bot drives Safari at a time: a lock in ~/.dsh/state/safari-lock.json makes a second
+Bot fail fast with "Safari is busy: <bot>" instead of fighting over the window (stale after 3 min).
+
+Every command works on THIS TOOL'S OWN TABS. The tabs the user has open are never
+focused, navigated, typed into or closed: a tab is driven only when it carries this
+tool's mark, which `open` writes, and a command with no Bot tab open fails instead of
+reaching for one of his. `--any` opts in to his tabs and is almost never right — his
+mail and his logins live there, and replacing one loses his place.
+
+--match works in ANY position (`safari js --match X 'code'` == `safari --match X js 'code'`).
+
+`fill` recipe shape (all keys optional except find):
+  {
+    "fields": [
+      {"find": {"label": "Name"},        "value": "My App"},
+      {"find": {"selector": "#email"},   "value": "a@b.com"},
+      {"find": {"placeholder": "Search"}, "value": "salsa", "enter": true},
+      {"find": {"aria": "Country"},      "value": "US", "kind": "select"},
+      {"find": {"label": "I agree"},     "checked": true}
+    ],
+    "submit": {"text": "Save"}
+  }
+  `find` accepts one of: selector, label, aria, placeholder, text, name.
+  Values are set through the native setter and fire input+change events, so
+  React/Vue/Angular forms see them. Nothing is submitted unless "submit" is set.
+"""
+import argparse, atexit, json, os, subprocess, sys, time
+
+JS_DOC = r"""
+function __dshScore(d){try{return d.body?d.body.innerText.length:-1}catch(e){return -1}}
+function __dshDoc(){
+  var best=document,bs=__dshScore(document);
+  function walk(d,dep){
+    if(dep>3)return;
+    var fs=[];try{fs=d.querySelectorAll('iframe,frame')}catch(e){return}
+    for(var i=0;i<fs.length;i++){
+      var cd=null;try{cd=fs[i].contentDocument}catch(e){cd=null}
+      if(!cd||cd===d)continue;
+      var s=__dshScore(cd);
+      if(s>bs){bs=s;best=cd}
+      walk(cd,dep+1);
+    }
+  }
+  walk(document,0);
+  return best;
+}
+"""
+JS_HELPERS = JS_DOC + r"""
+function __dshTxt(e){return ((e.getAttribute&&(e.getAttribute('aria-label')||''))+' '+(e.placeholder||'')+' '+(e.name||'')+' '+(e.textContent||'')).replace(/\s+/g,' ').trim().toLowerCase();}
+function __dshFind(f){
+  if(!f) return null;
+  try{
+  if(f.selector){ try{ var e=__dshDoc().querySelector(f.selector); if(e) return e; }catch(err){} }
+  var keys=['label','aria','placeholder','text','name'];
+  var n=null;
+  for(var k=0;k<keys.length;k++){ if(f[keys[k]]){ n=String(f[keys[k]]).toLowerCase(); break; } }
+  if(n===null) return null;
+  var els=[].slice.call(__dshDoc().querySelectorAll('input,textarea,select,button,a,[contenteditable=true],[role=button],[role=checkbox],[role=switch],[role=combobox]'));
+  for(var i=0;i<els.length;i++){ if(__dshTxt(els[i]).indexOf(n)>-1) return els[i]; }
+  var labels=[].slice.call(__dshDoc().querySelectorAll('label'));
+  for(var j=0;j<labels.length;j++){
+    if((labels[j].textContent||'').toLowerCase().indexOf(n)>-1){
+      var id=labels[j].getAttribute('for');
+      if(id){ var t=__dshDoc().getElementById(id); if(t) return t; }
+      var inner=labels[j].querySelector('input,textarea,select'); if(inner) return inner;
+    }
+  }
+  }catch(err){}
+  return null;
+}
+function __dshSet(e,v){
+  var tag=(e.tagName||'').toLowerCase();
+  if(tag==='select'){
+    e.value=v;
+    e.dispatchEvent(new Event('input',{bubbles:true}));
+    e.dispatchEvent(new Event('change',{bubbles:true}));
+    return e.value;
+  }
+  if(e.isContentEditable){
+    e.focus(); e.textContent=v;
+    e.dispatchEvent(new InputEvent('input',{bubbles:true}));
+    return e.textContent;
+  }
+  var d=Object.getOwnPropertyDescriptor(e.constructor.prototype,'value');
+  e.focus();
+  if(d&&d.set){ d.set.call(e,v); } else { e.value=v; }
+  e.dispatchEvent(new InputEvent('input',{bubbles:true}));
+  e.dispatchEvent(new Event('change',{bubbles:true}));
+  return e.value;
+}
+function __dshPress(e){
+  ['keydown','keypress','keyup'].forEach(function(t){
+    e.dispatchEvent(new KeyboardEvent(t,{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));
+  });
+  var form=e.form||e.closest&&e.closest('form');
+  if(form&&form.requestSubmit){ try{ form.requestSubmit(); return true; }catch(err){} }
+  return false;
+}
+"""
+
+JS_CTL = JS_DOC + r"""
+(function(){
+  var D=__dshDoc();
+  var sel='a[href],button,input,textarea,select,[role=button],[role=tab],[role=switch],[role=checkbox],[role=menuitem]';
+  var els=[].slice.call(D.querySelectorAll(sel)).filter(function(e){
+    var r=e.getBoundingClientRect(), st=getComputedStyle(e);
+    return r.width>0 && r.height>0 && st.visibility!=='hidden' && st.display!=='none';
+  });
+  window.__dshCtl = els;
+  return JSON.stringify(els.map(function(e,i){
+    return {i:i, tag:e.tagName.toLowerCase(), type:e.getAttribute('type')||'',
+      role:e.getAttribute('role')||'',
+      label:(e.getAttribute('aria-label')||'').slice(0,90),
+      text:(e.textContent||'').replace(/\s+/g,' ').trim().slice(0,70),
+      state:(e.getAttribute('aria-checked')||e.getAttribute('aria-expanded')||''),
+      disabled: !!e.disabled,
+      href:(e.getAttribute('href')||'').slice(0,90)};
+  }));
+})()
+"""
+
+JS_STATE = "JSON.stringify({href:location.href,ready:document.readyState,body:!!(document.body&&document.body.innerText.length)})"
+
+
+def osa(src, timeout=60):
+    p = subprocess.run(['osascript', '-e', src], capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout).strip())
+    return p.stdout.rstrip('\n')
+
+
+def all_tabs():
+    src = ('tell application "Safari"\nset out to ""\n'
+           'repeat with w from 1 to (count of windows)\n'
+           'repeat with t from 1 to (count of tabs of window w)\n'
+           'set out to out & (w as string) & linefeed & (t as string) & linefeed & (URL of tab t of window w) & linefeed & (name of tab t of window w) & linefeed\n'
+           'end repeat\nend repeat\nreturn out\nend tell')
+    out = osa(src)
+    lines = out.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    tabs = []
+    for i in range(0, len(lines) - 3, 4):
+        tabs.append({'window': int(lines[i]), 'index': int(lines[i + 1]),
+                     'url': lines[i + 2], 'title': lines[i + 3]})
+    return tabs
+
+
+STATE_PATH = os.path.join(os.path.expanduser('~'), '.dsh', 'state', 'safari-bot.json')
+LOCK_PATH = os.path.join(os.path.expanduser('~'), '.dsh', 'state', 'safari-lock.json')
+LOCK_STALE = 180          # seconds before a lock left by a dead run is taken over
+BOT_MARK = 'dsh-bot-tab'
+OWNER = None
+
+
+def owner():
+    """Which Bot is calling: its team name, else its session id, else 'default'.
+
+    One tab slot per Bot comes from this: every mark is 'dsh-bot-tab:<owner>' and the
+    state file keeps each owner's tabs under its own key.
+    """
+    global OWNER
+    if OWNER is not None:
+        return OWNER
+    sid = os.environ.get('DSH_SESSION_ID', '')
+    name = ''
+    if sid:
+        try:
+            with open(os.path.join(os.path.expanduser('~'), '.dsh', 'bot', 'state.json')) as fh:
+                name = ((json.load(fh).get('bots') or {}).get(sid) or {}).get('name') or ''
+        except Exception:
+            name = ''
+    OWNER = name.strip() or sid or 'default'
+    return OWNER
+
+
+def load_lock():
+    try:
+        with open(LOCK_PATH) as fh:
+            held = json.load(fh)
+        if isinstance(held, dict):
+            return held
+    except Exception:
+        pass
+    return {}
+
+
+def lock_acquire():
+    """One Bot drives Safari at a time; a second Bot is told who holds it, never made to wait."""
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, 'w') as fh:
+                json.dump({'owner': owner(), 'pid': os.getpid(), 'ts': time.time()}, fh)
+            return
+        except FileExistsError:
+            held = load_lock()
+            age = time.time() - float(held.get('ts') or 0)
+            if (held.get('owner') or '') == owner():
+                return
+            if age > LOCK_STALE:
+                try:
+                    os.unlink(LOCK_PATH)
+                except FileNotFoundError:
+                    pass
+                continue
+            raise SystemExit('Safari is busy: %s is using it (%ds). Try again in a moment.'
+                             % (held.get('owner') or 'another Bot', int(age)))
+
+
+def lock_release():
+    held = load_lock()
+    if (held.get('owner') or '') == owner():
+        try:
+            os.unlink(LOCK_PATH)
+        except FileNotFoundError:
+            pass
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as fh:
+            state = json.load(fh)
+        if isinstance(state, dict) and isinstance(state.get('owners'), dict):
+            mine = state['owners'].get(owner()) or {}
+            return {'tabs': list(mine.get('tabs') or []), 'last': mine.get('last')}
+    except Exception:
+        pass
+    return {'tabs': [], 'last': None}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    whole = {}
+    try:
+        with open(STATE_PATH) as fh:
+            whole = json.load(fh)
+    except Exception:
+        whole = {}
+    if not isinstance(whole, dict):
+        whole = {}
+    owners = whole.get('owners')
+    if not isinstance(owners, dict):
+        owners = {}
+    owners[owner()] = {'tabs': state['tabs'], 'last': state['last']}
+    whole = {'version': 2, 'owners': owners}
+    with open(STATE_PATH + '.part', 'w') as fh:
+        json.dump(whole, fh, indent=1, ensure_ascii=False)
+    os.replace(STATE_PATH + '.part', STATE_PATH)
+
+
+def mark_ours(t):
+    """Tag a tab as this tool's own, so a later call knows it may drive it."""
+    try:
+        run_js(t, 'window.name=%s;String(window.name)' % json.dumps(BOT_MARK + ':' + owner()))
+    except Exception:
+        pass
+
+
+def is_ours(t):
+    """True for a tab this tool opened, False for one it did not, None when the tab is asleep.
+
+    A suspended tab answers about:blank and reports no window.name, so None means "ask again
+    after focusing it" rather than "not ours".
+    """
+    try:
+        value = run_js(t, 'String(window.name)')
+    except Exception:
+        return None
+    if not value:
+        return None
+    return value.startswith(BOT_MARK + ':' + owner())
+
+
+def own_records():
+    """The tabs this tool opened and still finds, freshened with their live URL."""
+    state = load_state()
+    tabs = all_tabs()
+    live = []
+    for rec in state['tabs']:
+        hit = [t for t in tabs if t['window'] == rec.get('window') and t['index'] == rec.get('index')]
+        if hit:
+            live.append({'window': hit[0]['window'], 'index': hit[0]['index'],
+                         'url': hit[0]['url'], 'title': hit[0]['title']})
+    state['tabs'] = live
+    if state['last'] is not None and state['last'] >= len(live):
+        state['last'] = None
+    save_state(state)
+    return live
+
+
+def adopt(rec):
+    """The recorded tab, if it is still ours. None when it is gone or now belongs to the user.
+
+    Our own mark settles it. A sleeping tab cannot say, so it is accepted only while its URL
+    is still the one we recorded; anything else is left alone.
+    """
+    t = {'window': rec['window'], 'index': rec['index'], 'url': rec['url'], 'title': rec.get('title', '')}
+    ours = is_ours(t)
+    if ours is True:
+        return t
+    if ours is None and t['url'] and t['url'] == rec.get('url'):
+        return t
+    return None
+
+
+def remember(t):
+    """Record a tab we just opened or navigated, and make it the one later calls use."""
+    state = load_state()
+    state['tabs'] = [r for r in state['tabs']
+                     if (r.get('window'), r.get('index')) != (t['window'], t['index'])]
+    state['tabs'].append({'window': t['window'], 'index': t['index'], 'url': t['url']})
+    state['last'] = len(state['tabs']) - 1
+    save_state(state)
+
+
+def own_order(recs, match=None):
+    """The recorded tabs to try, best first: the last one used, then the rest."""
+    order = list(range(len(recs)))
+    last = load_state().get('last')
+    if last is not None and 0 <= last < len(recs):
+        order = [last] + [i for i in order if i != last]
+    if match:
+        order = [i for i in order if match.lower() in recs[i]['url'].lower()]
+    return order
+
+
+def pick(match, allow_any=False):
+    """The tab to work on. Only ever a tab this tool opened, unless --any says otherwise."""
+    if allow_any:
+        tabs = all_tabs()
+        if not tabs:
+            raise RuntimeError('no Safari windows open')
+        print('...--any: this may be a tab the user opened', file=sys.stderr)
+        if match:
+            hits = [t for t in tabs if match.lower() in t['url'].lower()]
+            if not hits:
+                raise RuntimeError('no tab matching %r; open tabs: %s' % (match, [t['url'][:60] for t in tabs]))
+            return hits[0]
+        return tabs[0]
+    recs = own_records()
+    if not recs:
+        raise RuntimeError('no Bot tab is open, and the user\'s tabs are left alone. '
+                           'Open a page first: safari open <url>')
+    order = own_order(recs, match)
+    if match and not order:
+        raise RuntimeError('no Bot tab matching %r; Bot tabs: %s' % (match, [r['url'][:70] for r in recs]))
+    for i in order:
+        t = adopt(recs[i])
+        if t:
+            return t
+    raise RuntimeError('the Bot tabs are gone (closed by hand?). Open a page again: safari open <url>')
+
+
+def run_js(t, code):
+    # JSON-escaped string literal keeps quotes/newlines safe inside AppleScript
+    src = ('tell application "Safari" to do JavaScript %s in tab %d of window %d'
+           % (json.dumps(code), t['index'], t['window']))
+    return osa(src)
+
+
+def focus(t):
+    src = ('tell application "Safari"\nset index of window %d to 1\n'
+           'set current tab of window %d to tab %d of window %d\nactivate\nend tell'
+           % (t['window'], t['window'], t['index'], t['window']))
+    osa(src)
+
+
+def tab_state(t):
+    """Best-effort {href, ready, body}. A suspended tab answers about:blank."""
+    try:
+        out = run_js(t, JS_STATE)
+        return json.loads(out)
+    except Exception as e:
+        return {'href': '', 'ready': '', 'body': False, 'error': str(e)}
+
+
+def ensure_ready(t, wait=15.0, quiet=False):
+    """Safari suspends background tabs: JS on them sees an empty about:blank
+    document. Focus the tab, then wait until a real document answers."""
+    st = tab_state(t)
+    href = st.get('href') or ''
+    if href and not href.startswith('about:'):
+        return st
+    if not quiet:
+        print('...tab was suspended (%s) — focusing and waiting' % (href or 'no response'), file=sys.stderr)
+    focus(t)
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        time.sleep(0.4)
+        st = tab_state(t)
+        href = st.get('href') or ''
+        if href and not href.startswith('about:'):
+            return st
+    if not quiet:
+        print('...still blank after %.0fs' % wait, file=sys.stderr)
+    return st
+
+
+def clip(s, n=6000):
+    return s if len(s) <= n else s[:n] + '\n...[truncated]'
+
+
+def run_fill(t, recipe, dry_run=False):
+    fields = recipe.get('fields', [])
+    payload = {'fields': [], 'submit': recipe.get('submit')}
+    for f in fields:
+        payload['fields'].append({'find': f.get('find', {}),
+                                  'value': f.get('value'),
+                                  'checked': f.get('checked'),
+                                  'kind': f.get('kind'),
+                                  'enter': bool(f.get('enter'))})
+    js = ("(function(){" + JS_HELPERS +
+          "var r=" + json.dumps(payload) + ";var out=[];"
+          "for(var i=0;i<r.fields.length;i++){var f=r.fields[i];var e=__dshFind(f.find);"
+          "if(!e){out.push({find:f.find,error:'not found'});continue;}"
+          "try{e.scrollIntoView({block:'center'});}catch(err){}"
+          "var rec={tag:e.tagName.toLowerCase(),found:true};"
+          + ("if(f.checked!==null&&f.checked!==undefined){var want=!!f.checked;"
+             "if(!!e.checked!==want){e.click();}rec.checked=!!e.checked;}"
+             "else{rec.value=__dshSet(e,String(f.value===null||f.value===undefined?'':f.value));}"
+             "if(f.enter){rec.pressed=__dshPress(e);}")
+          + "out.push(rec);}"
+          "var sub=null;"
+          "if(r.submit){var b=__dshFind(r.submit);"
+          "if(b){try{b.scrollIntoView({block:'center'});}catch(err){}b.click();sub='clicked '+((b.textContent||b.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim().slice(0,50));}"
+          "else{sub='submit target not found';}}"
+          "return JSON.stringify({href:location.href,results:out,submit:sub});})()")
+    if dry_run:
+        js = js.replace("__dshSet(e,String(", "((function(){return 'DRYRUN';})()||__dshSet(e,String(")
+    return run_js(t, js)
+
+
+def same_page(a, b):
+    """Two URLs are the same page when they differ only by a query or a trailing slash."""
+    return (a or '').split('?')[0].rstrip('/') == (b or '').split('?')[0].rstrip('/')
+
+
+def navigate(t, url):
+    osa('tell application "Safari"\nset URL of tab %d of window %d to "%s"\nend tell'
+        % (t['index'], t['window'], url.replace('"', '%22')))
+
+
+def new_bot_tab(url, recs):
+    """Append a tab of this tool's own to a window the user already has.
+
+    Never a new window: Safari fills a fresh window with tabs of its own, which is a mess to
+    undo. Never the user's tab either — this only adds.
+    """
+    known = {(r['window'], r['index']) for r in recs}
+    windows = all_tabs()
+    if recs:
+        w = recs[0]['window']
+    elif windows:
+        w = windows[0]['window']
+    else:
+        w = None
+    if w is None:
+        osa('tell application "Safari"\nactivate\nmake new document with properties {URL:"%s"}\nend tell'
+            % url.replace('"', '%22'))
+    else:
+        osa('tell application "Safari"\nactivate\n'
+            'make new tab at end of tabs of window %d with properties {URL:"%s"}\nend tell'
+            % (w, url.replace('"', '%22')))
+    for _ in range(30):
+        time.sleep(0.3)
+        for t in all_tabs():
+            if (t['window'], t['index']) in known:
+                continue
+            if same_page(t['url'], url):
+                mark_ours(t)
+                remember(t)
+                return t
+    raise RuntimeError('Safari did not report the tab it just opened')
+
+
+def main():
+    # --match is accepted in any position: pull it out before argparse sees it
+    argv, match_pre = [], None
+    i = 0
+    raw = sys.argv[1:]
+    while i < len(raw):
+        if raw[i] == '--match' and i + 1 < len(raw):
+            match_pre = raw[i + 1]; i += 2; continue
+        if raw[i].startswith('--match='):
+            match_pre = raw[i].split('=', 1)[1]; i += 1; continue
+        argv.append(raw[i]); i += 1
+
+    ap = argparse.ArgumentParser(prog='safari')
+    ap.add_argument('cmd')
+    ap.add_argument('args', nargs='*')
+    ap.add_argument('--match', default=None)
+    ap.add_argument('--any', action='store_true',
+                    help='allow a tab the user opened (off by default)')
+    ap.add_argument('--new', action='store_true',
+                    help='open a further Bot tab instead of reusing the Bot tab')
+    ap.add_argument('--index', type=int)
+    ap.add_argument('--text')
+    ap.add_argument('--aria')
+    ap.add_argument('--file')
+    ap.add_argument('--json')
+    ap.add_argument('--dry-run', action='store_true')
+    a = ap.parse_args(argv)
+    if match_pre:
+        a.match = match_pre
+
+    if a.cmd in ('tabs', 'wait', 'whoami'):
+        if a.cmd == 'wait':
+            time.sleep(float(a.args[0])); print('ok'); return
+        held = load_lock() if a.cmd == 'whoami' else {}
+        if a.cmd == 'whoami':
+            print(json.dumps({'owner': owner(),
+                              'safariBusyWith': held.get('owner') or None,
+                              'lockAgeSeconds': int(time.time() - float(held.get('ts') or 0)) if held else None},
+                             indent=1))
+            return
+    else:
+        lock_acquire()
+        atexit.register(lock_release)
+
+    if a.cmd == 'tabs':
+        ours = {(r['window'], r['index']) for r in own_records()}
+        for t in all_tabs():
+            mark = '*' if (t['window'], t['index']) in ours else ' '
+            print('%s%d.%d\t%s\t%s' % (mark, t['window'], t['index'], t['url'][:110], t['title'][:60]))
+        return
+
+    if a.cmd == 'open':
+        if not a.args:
+            raise SystemExit('usage: safari open URL [--new]')
+        url = a.args[0]
+        recs = own_records()
+        same = [r for r in recs if same_page(r['url'], url)]
+        if same and not a.new:
+            t = adopt(same[0])
+            if t:
+                ensure_ready(t)
+                print('Bot tab %d.%d already had it — %s' % (t['window'], t['index'], t['url'][:110]))
+                return
+        reuse = None
+        if not a.new:
+            for i in own_order(recs):
+                t = adopt(recs[i])
+                if t:
+                    reuse = t
+                    break
+        if reuse:
+            navigate(reuse, url)
+            remember(reuse)
+            print('opened in Bot tab %d.%d — %s' % (reuse['window'], reuse['index'], url))
+            return
+        t = new_bot_tab(url, recs)
+        print('opened a new Bot tab %d.%d — %s' % (t['window'], t['index'], url))
+        return
+
+    t = pick(a.match, a.any)
+
+    if a.cmd == 'focus':
+        focus(t)
+        st = ensure_ready(t)
+        print(json.dumps(st)); return
+
+    st = ensure_ready(t)
+
+    if a.cmd == 'js':
+        code = open(a.file).read() if a.file else (a.args[0] if a.args else sys.stdin.read())
+        print(clip(run_js(t, code), 20000)); return
+
+    if a.cmd == 'text':
+        print(clip(run_js(t, "(function(){" + JS_DOC + ";return __dshDoc().body?__dshDoc().body.innerText:''})()"), 6000)); return
+
+    if a.cmd == 'map':
+        ctl = run_js(t, JS_CTL)
+        text = run_js(t, "(function(){" + JS_DOC + ";var b=__dshDoc().body;return b?b.innerText.slice(0,1500):''})()")
+        controls = json.loads(ctl)
+        total = len(controls)
+        info = {'url': run_js(t, "(function(){" + JS_DOC + ";return __dshDoc().location.href})()"),
+                'title': run_js(t, "(function(){" + JS_DOC + ";return __dshDoc().title})()"),
+                'controlCount': total,
+                'text': text, 'controls': controls[:120]}
+        if total > 120:
+            info['note'] = 'showing first 120 of %d controls' % total
+        print(json.dumps(info, indent=1)); return
+
+    if a.cmd == 'click':
+        run_js(t, JS_CTL)   # refresh the control index
+        if a.index is not None:
+            js = ("(function(){var e=(window.__dshCtl&&window.__dshCtl[%d]);"
+                  "if(!e){return 'no __dshCtl index - run map first'}"
+                  "e.scrollIntoView({block:'center'});e.click();return 'clicked '+%d})()" % (a.index, a.index))
+        else:
+            needle = (a.text or a.aria or '')
+            js = ("(function(){var n=%s.toLowerCase();"
+                  "var els=window.__dshCtl;if(!els){return 'run map first'}"
+                  "for(var i=0;i<els.length;i++){var e=els[i];"
+                  "var hay=((e.getAttribute('aria-label')||'')+' '+(e.textContent||'')).toLowerCase();"
+                  "if(hay.indexOf(n)>-1){e.scrollIntoView({block:'center'});e.click();return 'clicked['+i+'] '+hay.replace(/\\s+/g,' ').slice(0,60)}}"
+                  "return 'no match for '+n})()" % json.dumps(needle))
+        print(run_js(t, js)); return
+
+    if a.cmd == 'type':
+        run_js(t, JS_CTL)   # refresh the control index
+        val = a.args[0] if a.args else ''
+        if a.index is not None:
+            js = ("(function(){var e=(window.__dshCtl&&window.__dshCtl[%d]);if(!e)return 'run map first';"
+                  "var s=Object.getOwnPropertyDescriptor(e.constructor.prototype,'value').set;"
+                  "e.focus();s.call(e,%s);e.dispatchEvent(new Event('input',{bubbles:true}));"
+                  "e.dispatchEvent(new Event('change',{bubbles:true}));return 'typed'})()" % (a.index, json.dumps(val)))
+        else:
+            js = ("(function(){var n=%s.toLowerCase();var els=window.__dshCtl;if(!els)return 'run map first';"
+                  "for(var i=0;i<els.length;i++){var e=els[i];var hay=((e.getAttribute('aria-label')||'')+' '+(e.placeholder||'')).toLowerCase();"
+                  "if(hay.indexOf(n)>-1){var s=Object.getOwnPropertyDescriptor(e.constructor.prototype,'value').set;e.focus();s.call(e,%s);"
+                  "e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return 'typed['+i+']'}}"
+                  "return 'no match'})()" % (json.dumps(a.aria or ''), json.dumps(val)))
+        print(run_js(t, js)); return
+
+    if a.cmd == 'fill':
+        if a.file:
+            recipe = json.load(open(a.file))
+        elif a.json:
+            recipe = json.loads(a.json)
+        else:
+            recipe = json.loads(sys.stdin.read())
+        out = run_fill(t, recipe, a.dry_run)
+        try:
+            data = json.loads(out)
+            if a.dry_run:
+                data['dry_run'] = True
+            print(json.dumps(data, indent=1)[:12000])
+        except ValueError:
+            print(out)
+        return
+
+    if a.cmd == 'shot':
+        out = a.args[0] if a.args else '/tmp/safari.png'
+        focus(t)
+        time.sleep(0.8)
+        bounds = osa('tell application "Safari" to get bounds of window %d' % t['window'])
+        x1, y1, x2, y2 = [int(float(v.strip())) for v in bounds.split(',')]
+        subprocess.run(['screencapture', '-x', '-R', '%d,%d,%d,%d' % (x1, y1, x2 - x1, y2 - y1), out], check=True)
+        print(out); return
+
+    raise SystemExit('unknown command: ' + a.cmd)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print('ERROR: %s' % e, file=sys.stderr)
+        sys.exit(1)

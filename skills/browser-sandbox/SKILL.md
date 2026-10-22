@@ -1,0 +1,16 @@
+---
+name: browser-sandbox
+description: Safari-only browsing rules, the one-tab-per-Bot Safari tool and its lock, what may be driven how, and the sandbox limits on Apple Events and headless Playwright.
+---
+
+## Browser / Sandbox notes
+
+- **Safari only** (see Rules). `open <url>` opens Safari — use that to show Ammaniel a page.
+- The browser-skill / `bsk` stack drives **Chrome** — it is NOT his real browser and its windows are not his sessions. Ask before using it, and never rely on it for anything that needs his logins.
+- Playwright + Chromium (in the pixwee repo) are fine for headless rendering/checks — that is not "his browser".
+- Note: `bsk` session windows close when Chrome closes; sessions are dropped ("session not registered or already stopped").
+- **Safari control tool** (2026-09-14; hardened 2026-10-11): `~/.dsh/bin/safari` drives Ammaniel's REAL Safari (AppleScript + `do JavaScript`) — `tabs`, `open`, `map`, `text`, `click --text/--aria/--index`, `type`, `js`, `shot`, `wait`. Full docs: `~/.dsh/SAFARI-CONTROL.md`. Use this for "go to this website and do this" requests.
+- **NEVER TOUCH A SAFARI TAB THE TOOL DID NOT OPEN.** (2026-10-11, after a Bot ran raw `osascript` and overwrote the tab Ammaniel was reading) `safari open URL` makes or reuses ONE tab of the tool's own and marks it (`*` in `safari tabs`); every other command works only on such a tab and fails with "no Bot tab is open" instead of reaching for one of his. **Never run `osascript` to set the URL of, close, type into or click in a Safari tab. Never open a URL into his front tab. Never make a new Safari *window*** — `make new document` makes Safari fill it with tabs of its own. Go through the tool, or ask him first. `--any` opts in to his tabs and is almost never right.
+- **ONE TAB PER BOT, ONE BOT AT A TIME.** (2026-10-17, after two Bots fought over the same Safari tab: `~/.dsh/state/safari-bot.json` held a single slot for the whole machine) `~/.dsh/bin/safari` now keeps a tab slot per Bot — the mark is `dsh-bot-tab:<Bot name>`, resolved from `DSH_SESSION_ID` in `~/.dsh/bot/state.json` — and a lock (`~/.dsh/state/safari-lock.json`) lets one Bot drive at a time; a second Bot exits at once with `Safari is busy: <Bot> is using it (Ns)` and never waits, retries in a loop, or reaches for the other Bot's tab (stale after 3 minutes). `safari whoami` shows your name and who holds Safari. Never edit that state file by hand, and never delete the lock to get in.
+- **Safari control needs an UNCONFINED session.** Under the file sandbox Apple Events fail with `-10004 privilege violation`, so the session must run with the sandbox off (danger-full-access) or the tool is dead. Never use `safaridriver` — it opens a separate, logged-out profile.
+- **I CAN SEE THE SCREEN — never tell Ammaniel "I can't see it."** (Ammaniel, 2026-09-29) `screencapture -x -t png /tmp/shot.png` captures his whole screen, and `read_image` reads it. **This includes the harness sidebar browser panel.** So when he says **"you can see it," he is right** — capture and read it. Use this to guide him click-by-click through any GUI (KDP, dashboards, settings, checkout pages) instead of claiming blindness. Downscale first (`resize` ~50%) if the capture is large. Treat screenshots as private: read only what the task needs, and never screenshot without a reason tied to his request.
