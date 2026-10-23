@@ -1,0 +1,53 @@
+#!/bin/bash
+# home-push — commit the SAFE settings set in ~/.dsh and push it to GitHub.
+# Secrets, tokens, device keys, sessions, node_modules stay on this Mac.
+# Usage: home-push [--dry]
+set -euo pipefail
+
+DSH="/Users/nakfaai/.dsh"
+cd "$DSH"
+DRY=0
+[ "${1:-}" = "--dry" ] && DRY=1
+
+# allowlist only — nothing else is ever staged
+DOCS=(agents.md PRIORITY.md persona.md DESIGN.md SAFARI-CONTROL.md lessons.md STRUCTURE.md FOCUS.md SESSION.md MEMORY.md plugins.md math-snippets.json settings.yaml)
+DIRS=(skills bin)
+FILES=(profiles/desktop/package.json)
+
+# 1. safety scan: refuse secret-looking names anywhere in the allowlist
+RISK=$( { for f in "${DOCS[@]}" "${FILES[@]}"; do [ -e "$f" ] && echo "$f"; done
+          for d in "${DIRS[@]}"; do [ -d "$d" ] && find "$d" -type f; done
+        } | grep -iE '(^|/)(\.?credentials?|\.env|.*\.env\..*|.*\.p8|.*\.pem|.*\.key|id_rsa.*|.*secret.*|.*token.*)$' || true)
+if [ -n "$RISK" ]; then
+  echo "REFUSED — secret-looking file inside the allowlist:"
+  echo "$RISK"
+  exit 2
+fi
+
+# 2. stage allowlisted paths only (deletions inside those paths included)
+PATHS=()
+for f in "${DOCS[@]}" "${FILES[@]}"; do [ -e "$f" ] && PATHS+=("$f"); done
+for d in "${DIRS[@]}"; do [ -d "$d" ] && PATHS+=("$d"); done
+git add -A -- "${PATHS[@]}"
+# drop retired machine-local assets that the ignore file already covers
+if [ -n "$(git ls-files background/ | head -1)" ]; then git rm -r -q --cached background >/dev/null 2>&1 || true; fi
+
+# 3. report
+echo "--- staged ---"
+git diff --cached --stat | tail -20
+COUNT=$(git diff --cached --name-only | wc -l | tr -d ' ')
+echo "files staged: $COUNT"
+if [ "$DRY" = "1" ]; then echo "dry run — nothing committed or pushed"; exit 0; fi
+if [ "$COUNT" = "0" ]; then echo "nothing changed since the last push"; exit 0; fi
+
+# 4. commit + push
+git -c user.name="DSH Settings" -c user.email="settings@nakfaai.local" \
+  commit -q -m "home: sync $(date '+%Y-%m-%d %H:%M')"
+if git push -q origin HEAD:main 2>/dev/null; then
+  echo "pushed: $(git log --oneline -1)"
+else
+  echo "COMMIT MADE BUT PUSH FAILED — run: git -C $DSH push origin HEAD:main"
+  exit 3
+fi
+echo
+echo "on the other Mac: git -C ~/.dsh pull"

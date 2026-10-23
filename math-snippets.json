@@ -1,0 +1,11 @@
+{
+  "snippets": {
+    "yy": {
+      "body": "ai@nakfaai.com",
+      "auto": true,
+      "open": true,
+      "word": true,
+      "desc": "my email"
+    }
+  }
+}

@@ -1102,10 +1102,10 @@ def main():
     for key, rec in answers.items():
         if key in live_keys:
             continue
-        when = esc((rec.get("at") or "")[11:16])
+        taptime = esc((rec.get("at") or "")[11:16])
         mark = "✅ yes" if (rec.get("answer") or "").lower() == "yes" else "🟡 hold"
         done_rows.append((rec.get("at") or "", '<li><b>%s</b> — %s<span class="when">%s · %s</span></li>'
-                          % (esc((rec.get("app") or "").strip()), esc((rec.get("step") or "")[:120]), mark, when)))
+                          % (esc((rec.get("app") or "").strip()), esc((rec.get("step") or "")[:120]), mark, taptime)))
     done_rows.sort(reverse=True)
     done_html = ""
     if done_rows:
