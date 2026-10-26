@@ -33,3 +33,17 @@ logs/
 plugin-patch-backup-*/
 .dsh-any-background-data/
 2-HARDCOVER-COVER-360x265.pdf
+
+# Machine-local / secrets (added 2026-10-26)
+openai-gateway/
+our-free-model/
+ext-bridge-token
+profiles/*/vendor/
+profiles/*/plugins/
+profiles/*/.dsh-market/
+profiles/*/.plugin-manager/
+*.log
+.dshw-*.json
+.dsh-remote-install-id
+mic-hotkey-*.json
+mic-hotkey-debug.log

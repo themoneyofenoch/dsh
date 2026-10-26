@@ -131,11 +131,11 @@ h1{margin:0 0 2px;font-size:24px;font-weight:700;letter-spacing:-.2px}
 main{padding:20px 22px 60px}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--soft);
  margin:26px 0 12px;font-weight:600}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:18px}
 figure{margin:0;background:#fff;border:1px solid var(--line);border-radius:14px;
  overflow:hidden;cursor:pointer}
 figure:hover{border-color:#ccc}
-figure img{display:block;width:100%;height:180px;object-fit:cover;background:#f4f1ea}
+figure img{display:block;width:100%;height:330px;object-fit:cover;background:#f4f1ea}
 figcaption{padding:9px 11px 11px;font-size:13px}
 figcaption b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;
  text-overflow:ellipsis}
@@ -154,11 +154,18 @@ figcaption span{color:var(--soft);font-size:12px}
 figure .pick{position:absolute;top:8px;right:8px;z-index:2;background:#ffffffe6}
 figure{position:relative}
 a.open{display:block}
-.folders{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
+.side{position:fixed;top:0;right:0;bottom:0;width:236px;z-index:8;overflow:auto;
+ background:#fff;border-left:1px solid var(--line);padding:16px 12px 28px}
+.side h2{margin:0 0 10px}
+.folders{display:flex;flex-direction:column;gap:6px;align-items:stretch}
 .folders .fl{display:flex;align-items:center;gap:6px;border:1px solid var(--line);
- background:#fff;border-radius:999px;padding:4px 6px 4px 12px;font-size:13px}
-.folders .fl a{color:var(--ink);text-decoration:none}
+ background:#fff;border-radius:10px;padding:5px 6px 5px 10px;font-size:13px;
+ justify-content:space-between}
+.folders .fl a{color:var(--ink);text-decoration:none;overflow:hidden;
+ text-overflow:ellipsis;white-space:nowrap}
 .folders .fl a:hover{text-decoration:underline}
+body{padding-right:236px}
+@media (max-width:900px){.side{display:none}body{padding-right:0}}
 .empty{color:var(--soft);padding:40px 4px}
 footer{color:var(--soft);font-size:12px;padding:0 22px 40px}
 """
@@ -239,8 +246,11 @@ def render(rows, root):
     folders = {}
     for r in rows:
         folders.setdefault(r["folder"], r["dir"])
+    out.append("</header>")
+
+    # Folders sit in their own panel on the right, so they never cover the page.
     if folders:
-        out.append('<div class="folders"><span class="sub" style="margin:0">Folders:</span>')
+        out.append('<aside class="side"><h2>Folders</h2><div class="folders">')
         for name in sorted(folders, key=str.lower):
             furi = "file://" + urllib.parse.quote(folders[name], safe="/") + "/"
             out.append('<span class="fl"><a href="%s" target="_blank" rel="noopener">%s</a>'
@@ -248,9 +258,9 @@ def render(rows, root):
                        'data-path="%s">&#128193;</button></span>' % (
                            html.escape(furi, quote=True), html.escape(name),
                            html.escape(folders[name], quote=True)))
-        out.append("</div>")
+        out.append("</div></aside>")
 
-    out.append("</header><main>")
+    out.append("<main>")
 
     def href(r):
         return "file://" + urllib.parse.quote(r["abs"], safe="/")

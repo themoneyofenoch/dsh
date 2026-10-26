@@ -2,19 +2,25 @@
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "@linxin666/dsh-remote-web-ui": "^0.3.18",
-    "@michengai/dsh-automation": "^0.1.34",
+    "@linxin666/dsh-client-ui-git-graph": "^0.3.24",
+    "@linxin666/dsh-client-ui-skill-explorer": "^0.3.24",
+    "@linxin666/dsh-client-ui-task-board": "^0.3.24",
+    "@linxin666/dsh-remote-web-ui": "^0.3.24",
+    "@liustack/modlens": "^3.26.2",
+    "@michengai/dsh-automation": "^0.1.45",
     "@tt-a1i/archify-dsh": "0.1.0",
+    "@vectorize-io/hindsight-coding-agents": "^0.6.1",
     "@wxg-prc-cpg/browser-skill-dsh-plugin": "github:Tencent/BrowserSkill#path:/packages/dsh-plugin-browserskill",
-    "@xmanrui/dsh-im": "^4.15.0",
-    "@yuxianglin/dsh-bridge-browser": "link:/Users/nakfaai/.dsh/dsh-browser/packages/browser/bridge-browser",
+    "@xmanrui/dsh-im": "^4.24.0",
+    "@zseven-w/dsh-ios": "0.1.0-rc.10",
     "dsh-background-nakfaai": "github:themoneyofenoch/dsh-background-nakfaai",
-    "dsh-better-sidebar": "0.18.1",
-    "dsh-context": "^0.46.0",
-    "dsh-dream-skin": "^8.30.1",
+    "dsh-better-sidebar": "0.19.1",
+    "dsh-context": "^0.53.3",
+    "dsh-dream-skin": "^9.16.0",
+    "dsh-element-source": "^0.1.0",
     "dsh-oil-sticky-prompt": "github:oil-oil/dsh-oil-sticky-prompt",
     "dsh-plugin-doctor": "github:lin-cheng-lab/dsh-plugin-doctor",
-    "dshmarket": "^1.45.1"
+    "dshmarket": "^1.48.0"
   },
   "dsh": {
     "profile": {
@@ -23,7 +29,6 @@
         "@deepseek-ai/dsh-web-app",
         "dsh-plugin-doctor",
         "dsh-background-nakfaai",
-        "dsh-better-sidebar",
         "@tt-a1i/archify-dsh",
         "@michengai/dsh-automation",
         "dsh-oil-sticky-prompt",
@@ -32,7 +37,13 @@
         "@linxin666/dsh-remote-web-ui",
         "@xmanrui/dsh-im",
         "@wxg-prc-cpg/browser-skill-dsh-plugin",
-        "dsh-dream-skin"
+        "dsh-dream-skin",
+        "@linxin666/dsh-client-ui-task-board",
+        "@vectorize-io/hindsight-coding-agents",
+        "@liustack/modlens",
+        "@linxin666/dsh-client-ui-skill-explorer",
+        "@linxin666/dsh-client-ui-git-graph",
+        "@zseven-w/dsh-ios"
       ]
     }
   }

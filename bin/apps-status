@@ -29,6 +29,9 @@ const HOME = process.env.HOME;
 const STATE = path.join(HOME, '.dsh/state');
 const GATE_FILE = path.join(STATE, 'apps-gates.json');
 const OUT_FILE = path.join(STATE, 'apps-status.json');
+const TESTED_FILE = path.join(STATE, 'apps-tested.json');
+const NEXT_FILE = path.join(STATE, 'apps-next.json');
+function nextOverride(slug) { try { const j = JSON.parse(fs.readFileSync(NEXT_FILE, 'utf8')); return j[slug] || null; } catch { return null; } }
 const STORESHIP = path.join(HOME, '.dsh/bin/storeship');
 const KEY_ID = 'DASF43QDRT';
 const ISSUER = '0418454e-4e54-4fc7-a387-b3b2460fd5e8';
@@ -42,6 +45,7 @@ const APPS = [
   { slug: 'pixwee', name: 'Pixwee', bundleId: 'com.pixwee.app', playPackage: 'com.pixwee.app', dir: `${P}/pixwee`, icon: '/Users/nakfaai/output/apps/icons/pixwee.png', artDir: '/Users/nakfaai/output/pixwee-store-art' },
   { slug: 'netbrew', name: 'Netbrew', bundleId: 'com.silki.app', playPackage: 'com.silki.app', dir: `${P}/netbrew`, icon: '/Users/nakfaai/output/apps/icons/netbrew.png' },
   { slug: 'geezeasy', name: 'GeezEasy', bundleId: 'com.geezeasy.app', playPackage: 'com.geezeasy.app', dir: `${P}/GeezEasy`, icon: '/Users/nakfaai/output/apps/icons/geezeasy.png' },
+  { slug: 'latindance', name: 'Latindance', bundleId: 'ai.latindance.app', playPackage: 'ai.latindance.app', dir: `${P}/latindance`, icon: '/Users/nakfaai/output/apps/icons/latindance.png' },
 ];
 
 const args = process.argv.slice(2);
@@ -83,9 +87,11 @@ function ascToken() {
   return i + '.' + b64(crypto.sign('sha256', Buffer.from(i), { key: fs.readFileSync(KEY_PATH, 'utf8'), dsaEncoding: 'ieee-p1363' }));
 }
 let ASC = null;
+let ASC_AT = 0;
 const TIMEOUT = 12000;
 async function asc(p) {
-  ASC = ASC || ascToken();
+  // A run can outlast the 15-minute Apple token; re-mint it rather than 401 halfway.
+  if (!ASC || Date.now() - ASC_AT > 600000) { ASC = ascToken(); ASC_AT = Date.now(); }
   call('ASC GET ' + p.split('?')[0]);
   const r = await fetch('https://api.appstoreconnect.apple.com' + p, { headers: { Authorization: 'Bearer ' + ASC }, signal: AbortSignal.timeout(TIMEOUT) });
   const t = await r.text();
@@ -119,6 +125,15 @@ async function appleState(app) {
     const current = out.versions.find((v) => !['READY_FOR_SALE', 'DEVELOPER_REMOVED_FROM_SALE'].includes(v.state)) || out.versions[0];
     out.live = live ? { version: live.version, build: live.build?.version || null } : null;
     out.current = current ? { id: current.id, version: current.version, state: current.state, build: current.build } : null;
+
+    // review submissions: what is actually sitting with Apple right now
+    try {
+      const subs = await ascAll(`/v1/reviewSubmissions?filter[app]=${a.id}&limit=6`);
+      out.subs = (subs || []).map((s) => ({ state: s.attributes.state, created: s.attributes.createdDate, submitted: s.attributes.submittedDate || null }))
+        .sort((x, y) => String(y.created || '').localeCompare(String(x.created || '')));
+      const sent = out.subs.find((s) => s.submitted);
+      out.review = sent ? { state: sent.state, submitted: sent.submitted } : null;
+    } catch (e) { out.subs = null; out.review = null; }
 
     if (!out.versions.length) out.reds.push('Apple: no version created');
     else if (!out.current?.build) out.reds.push(`Apple: ${out.current?.version || '?'} has no build attached`);
@@ -178,8 +193,8 @@ async function appleState(app) {
     } catch (e) { out.notes.push('testflight not checked (' + e.message.slice(0, 60) + ')'); }
 
     // Xcode Cloud — Apple's own build service, read for the same app id
-    out.ci = await ciState(a.id);
-    if (!out.ci.ok && out.ci.reds.length) out.reds.push(...out.ci.reds);
+    out.ci = await ciState(a.id, a.attributes && a.attributes.bundleId);
+    if (out.ci.reds.length) out.reds.push(...out.ci.reds);
     if (out.ci.notes.length) out.notes.push(...out.ci.notes);
     out.ok = true;
   } catch (e) {
@@ -257,23 +272,69 @@ async function playState(app) {
 }
 
 // ── Xcode Cloud ──────────────────────────────────────────────────────────────
-async function ciState(appId) {
+let CI_PRODS = null;
+async function ciProductsFor(bundleId) {
+  if (!CI_PRODS) {
+    CI_PRODS = (async () => {
+      const all = [];
+      let cursor = null, pages = 0;
+      do {
+        const r = await asc(`/v1/ciProducts?limit=200${cursor ? '&cursor=' + encodeURIComponent(cursor) : ''}`);
+        all.push(...(r.data || []));
+        cursor = r.links && r.links.next ? new URL(r.links.next).searchParams.get('cursor') : null;
+        pages += 1;
+      } while (cursor && pages < 5);
+      const out = [];
+      for (const pr of all) {
+        let bid = null;
+        try { const ap = await asc(`/v1/ciProducts/${pr.id}/app`); bid = ap.data && ap.data.attributes ? ap.data.attributes.bundleId : null; } catch (e) {}
+        out.push({ id: pr.id, name: pr.attributes.name, bundleId: bid });
+      }
+      return out;
+    })();
+  }
+  const all = await CI_PRODS;
+  return all.filter((x) => x.bundleId && bundleId && x.bundleId === bundleId);
+}
+
+async function ciState(appId, bundleId) {
   const out = { ok: false, reds: [], notes: [], product: null, workflow: null, run: null };
   try {
-    const prods = await asc(`/v1/ciProducts?filter[app]=${appId}&limit=5`);
-    const prod = (prods.data || [])[0];
-    if (!prod) { out.reds.push('Xcode Cloud: not connected'); return out; }
-    out.product = prod.attributes.name;
-    const wfs = await asc(`/v1/ciProducts/${prod.id}/workflows?limit=5`);
-    const wf = (wfs.data || [])[0];
-    if (!wf) { out.reds.push('Xcode Cloud: product with no workflow'); return out; }
-    out.workflow = wf.attributes.name;
-    const runs = await asc(`/v1/ciWorkflows/${wf.id}/buildRuns?limit=10`);
-    const r = (runs.data || []).slice().sort((x, y) => Number(y.attributes.number) - Number(x.attributes.number))[0];
-    if (!r) { out.notes.push('Xcode Cloud: no build run yet'); out.ok = true; return out; }
+    let list = [];
+    try { list = await ciProductsFor(bundleId); } catch (e) { list = []; }
+    if (!list.length) {
+      const prods = await asc(`/v1/ciProducts?filter[app]=${appId}&limit=20`);
+      list = (prods.data || []).map((pr) => ({ id: pr.id, name: pr.attributes.name, bundleId }));
+    }
+    if (!list.length) { out.reds.push('Xcode Cloud: not connected'); return out; }
+    let best = null;
+    for (const prod of list) {
+      let wfs;
+      try { wfs = await asc(`/v1/ciProducts/${prod.id}/workflows?limit=10`); } catch (e) { continue; }
+      for (const wf of (wfs.data || [])) {
+        let runs = [], cursor = null, pages = 0;
+        try {
+          do {
+            const r = await asc(`/v1/ciWorkflows/${wf.id}/buildRuns?limit=200${cursor ? '&cursor=' + encodeURIComponent(cursor) : ''}`);
+            runs.push(...(r.data || []));
+            cursor = r.links && r.links.next ? new URL(r.links.next).searchParams.get('cursor') : null;
+            pages += 1;
+          } while (cursor && pages < 4);
+        } catch (e) { continue; }
+        for (const r of runs) {
+          const t = Date.parse(r.attributes.createdDate || 0) || 0;
+          if (!best || t > best.t) best = { t, run: r, product: prod.name, workflow: wf.attributes.name };
+        }
+      }
+    }
+    if (!best) { out.product = list[0].name; out.notes.push('Xcode Cloud: no build run yet'); out.ok = true; return out; }
+    const r = best.run;
+    out.product = best.product;
+    out.workflow = best.workflow;
     out.run = { id: r.id, number: r.attributes.number, status: r.attributes.completionStatus, progress: r.attributes.executionProgress, created: r.attributes.createdDate };
     if (r.attributes.completionStatus === 'FAILED') out.reds.push(`Xcode Cloud: build #${r.attributes.number} failed`);
     else if (['RUNNING', 'PENDING'].includes(r.attributes.executionProgress)) out.notes.push(`Xcode Cloud: build #${r.attributes.number} ${r.attributes.executionProgress.toLowerCase()}`);
+    else if (r.attributes.completionStatus === 'CANCELED') out.notes.push(`Xcode Cloud: build #${r.attributes.number} canceled`);
     out.ok = true;
   } catch (e) {
     out.notes.push('Xcode Cloud: read failed (' + e.message.slice(0, 70) + ')');
@@ -292,6 +353,10 @@ function repoState(app) {
     out.branch = branch;
     const head = execFileSync('git', ['-C', app.dir, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
     out.head = head;
+    out.headDate = execFileSync('git', ['-C', app.dir, 'log', '-1', '--format=%cd', '--date=format:%m-%d %H:%M'], { encoding: 'utf8' }).trim();
+    try {
+      out.unpushed = Number(execFileSync('git', ['-C', app.dir, 'rev-list', '--count', 'HEAD', '--not', '--remotes'], { encoding: 'utf8' }).trim()) || 0;
+    } catch (e) { out.unpushed = null; }
     const iconFile = execFileSync('bash', ['-lc', `find "${app.dir}" \\( -name node_modules -o -name Pods -o -name .git -o -name build -o -name DerivedData -o -name .gradle -o -name .next -o -name dist \\) -prune -o -path '*AppIcon.appiconset/*.png' -print | head -1`], { encoding: 'utf8', timeout: 25000, killSignal: 'SIGKILL' }).trim();
     if (iconFile) {
       const w = (execFileSync('sips', ['-g', 'pixelWidth', iconFile], { encoding: 'utf8' }).match(/pixelWidth:\s*(\d+)/) || [])[1];
@@ -334,7 +399,7 @@ function line(row) {
 // ── log + page ───────────────────────────────────────────────────────────────
 const LOG_FILE = path.join(STATE, 'apps-log.md');
 const PAGE_FILE = '/Users/nakfaai/output/apps/status.html';
-const OWNER = { kalkidan: 'Kalkidan', pixwee: 'Pixwee', netbrew: 'netbrew', geezeasy: 'GeezEsay' };
+const OWNER = { kalkidan: 'Kalkidan', pixwee: 'Pixwee', netbrew: 'netbrew', geezeasy: 'GeezEsay', latindance: 'Latindance' };
 const APP_DIR = Object.fromEntries(APPS.map((a) => [a.slug, a.dir]));
 const SHOT_LABEL = {
   APP_IPHONE_67: '6.7"', APP_IPHONE_65: '6.5"', APP_IPHONE_61: '6.1"', APP_IPHONE_55: '5.5"',
@@ -410,7 +475,7 @@ function ambers(row) {
   if (thin.length) out.push({ label: 'Apple screenshots', text: Math.min(...thin.map(([, n]) => n)) + ' per size on ' + thin.length + ' size' + (thin.length === 1 ? '' : 's') });
   const pi = (row.play && row.play.playImages) || {};
   if (pi.phoneScreenshots > 0 && pi.phoneScreenshots < 3) out.push({ label: 'Play screenshots', text: pi.phoneScreenshots + ' only' });
-  for (const n of row.notes || []) if (String(n).startsWith('Xcode Cloud: ')) out.push({ label: 'Xcode Cloud', text: String(n).slice(14) });
+  for (const n of row.notes || []) if (String(n).startsWith('Xcode Cloud: ')) out.push({ label: 'Xcode Cloud', text: String(n).replace(/^Xcode Cloud: /, '') });
   return out;
 }
 
@@ -443,6 +508,8 @@ function inPlace(r) {
 }
 
 function nextStep(row) {
+  const ov = nextOverride(row.slug);
+  if (ov) return ov;
   const a = row.apple || {};
   const owner = OWNER[row.slug] || row.name;
   const st = a.current && a.current.state;
@@ -464,12 +531,65 @@ function nextStep(row) {
   if (newer) return 'build ' + newer + ' waits for your yes on a version number';
   const amber65 = ambers(row).find((o) => /^6\.5/.test(o.label));
   if (amber65) return 'your call on the 6.5" screenshots — finish the set or remove it';
-  if (has(/Play: production track empty/)) return 'promote a build to Play production after your yes';
+  const thinShots = has(/Apple screenshots/)
+    || ambers(row).some((o) => o && o.label === 'Apple screenshots')
+    || (row.notes || []).some((n) => /thin screenshots/.test(n));
+  if (thinShots) return 'your yes on the shot set — the store sizes are thin';
+  const appleReady = st === 'PREPARE_FOR_SUBMISSION'
+    && !row.reds.some((x) => /^(Apple|Xcode Cloud):/.test(x))
+    && !has(/no build attached/);
+  if (appleReady) return 'your Submit click on Apple is the only step left';
+  if (has(/Play: production track empty/)) return 'Google Play wants 12 testers opted in for 14 days, then your Apply click';
   if (has(/GitHub: \d+ files not committed/)) {
     const m = row.reds.find((x) => /GitHub: \d+ files/.test(x));
     return owner + ' commits and pushes — ' + m.replace('GitHub: ', '');
   }
   return 'nothing missing';
+}
+
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function shortDay(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago', month: '2-digit', day: '2-digit' }).formatToParts(d);
+  const g = (t) => (p.find((x) => x.type === t) || {}).value;
+  return MON[Number(g('month')) - 1] + ' ' + Number(g('day'));
+}
+
+// What Apple and Google Play have right now: sent, in review, or still a draft.
+function reviewInfo(row) {
+  const a = row.apple || {};
+  const cur = a.current || null;
+  const subsRead = a.subs !== null && a.subs !== undefined;
+  const sentISO = a.review && a.review.submitted ? a.review.submitted : null;
+  const sentDay = shortDay(sentISO);
+  let apple;
+  if (!subsRead) apple = { tone: 'muted', label: 'not checked', text: 'Apple did not answer for this app this run.' };
+  else if (cur && ['WAITING_FOR_REVIEW', 'IN_REVIEW', 'UNRESOLVED_ISSUES'].includes(cur.state)) {
+    apple = { tone: 'review', label: 'in review', text: (cur.version || '') + ' · build ' + (cur.build ? cur.build.version : '—') + (sentDay ? ' · sent ' + sentDay : '') + ' — Apple has it now.' };
+  } else if (cur && cur.state === 'READY_FOR_SALE') {
+    apple = { tone: 'ok', label: 'live', text: (a.live ? a.live.version : cur.version) + (sentDay ? ' · last sent ' + sentDay : '') + ' — nothing with Apple.' };
+  } else if (cur) {
+    apple = { tone: 'draft', label: 'not sent', text: cur.version + (cur.build ? ' · build ' + cur.build.version + ' attached' : ' · no build attached') + (a.review && a.review.state === 'READY_FOR_REVIEW' ? ' · a submission is prepared, not sent' : '') + ' — your Submit click has not happened.' };
+  } else {
+    apple = { tone: 'muted', label: 'no version', text: 'No App Store version is created yet.' };
+  }
+
+  const t = (row.play && row.play.tracks) || {};
+  const prod = t.production;
+  const underReview = Object.entries(t).find(([, v]) => v && (v.status === 'draft' || v.status === 'inProgress'));
+  let play;
+  if (!row.play || row.play.error) play = { tone: 'muted', label: 'not checked', text: 'Google Play did not answer for this app this run.' };
+  else if (prod && prod.versionCodes && prod.versionCodes.length) play = { tone: 'ok', label: 'live', text: 'production ' + prod.versionCodes.join(', ') + ' — nothing under review.' };
+  else if (underReview) play = underReview[1].status === 'inProgress'
+    ? { tone: 'review', label: 'in review', text: (underReview[1].versionCodes || []).join(', ') + ' on ' + underReview[0] + ' — Play is reviewing it.' }
+    : { tone: 'draft', label: 'staged', text: (underReview[1].versionCodes || []).join(', ') + ' on ' + underReview[0] + ' — staged, not sent for review.' };
+  else {
+    const low = ['alpha', 'internal', 'beta'].map((k) => (t[k] && t[k].versionCodes && t[k].versionCodes.length ? k + ' ' + t[k].versionCodes.join(', ') : null)).filter(Boolean);
+    play = { tone: 'draft', label: 'not sent', text: 'nothing under review — production empty' + (low.length ? ' · only ' + low.join(' · ') : '') + '.' };
+  }
+  return { apple, play };
 }
 
 function readGoal(dir) {
@@ -488,12 +608,71 @@ function readGoal(dir) {
   } catch (e) { return null; }
 }
 
+// ── tested: one short file the page reads, written by hand after a real test pass ──
+// { "<slug>": { "full": true|false, "by": "Tester 2", "date": "10-26", "left": "Android not tried" } }
+function loadTested() {
+  try { return JSON.parse(fs.readFileSync(TESTED_FILE, 'utf8')); } catch (e) { return {}; }
+}
+function testedCell(t) {
+  if (!t || t.full === undefined) return '<span class="tst no">⚪ not checked</span>';
+  const when = t.date ? ' · ' + esc(t.date) : '';
+  const by = t.by ? '<div class="sub">' + esc(t.by) + '</div>' : '';
+  return t.full
+    ? '<span class="tst yes">✅ full' + when + '</span>' + by
+    : '<span class="tst part">🟡 part' + when + '</span>' + (t.left ? '<div class="sub">' + esc(t.left) + '</div>' : by);
+}
+
 function renderPage(payload) {
   const rows = [...payload.apps].sort((a, b) => b.reds.length - a.reds.length);
   const totalRed = rows.reduce((n, r) => n + r.reds.length, 0);
   const totalAmber = rows.reduce((n, r) => n + ambers(r).length, 0);
   const g = loadGates();
   const checked = fmtChicago(new Date(payload.generatedAt));
+
+  // ── the one table: every system, one row per app ──
+  const tested = loadTested();
+  const oneLook = rows.map((r) => {
+    const a = r.apple || {};
+    const ci = a.ci || {};
+    const run = ci.run || {};
+    const pl = r.play || {};
+    const t = pl.tracks || {};
+    const rp = r.repo || {};
+    const cur = a.current || {};
+    const gh = '<b>' + esc(rp.head || '—') + '</b><div class="sub">' + esc(rp.headDate || '') +
+      (rp.unpushed ? ' · ' + rp.unpushed + ' not pushed' : '') + '</div>';
+    const cloud = run.number
+      ? '#' + run.number + ' ' + (run.status === 'SUCCEEDED' ? '<b class="ok">passed</b>'
+        : run.status === 'FAILED' ? '<b class="bad">failed</b>' : esc(String(run.status || '').toLowerCase())) +
+        '<div class="sub">' + esc(shortDay(run.created) || '') + '</div>'
+      : '<span class="none">not connected</span>';
+    const sent = a.review && a.review.submitted ? shortDay(a.review.submitted) : null;
+    const appleCell = cur.version
+      ? '<b>' + esc(cur.version) + (cur.build ? ' · ' + esc(cur.build.version) : '') + '</b><div class="sub">' +
+        esc(stateWord(cur.state)) + (sent ? ' · sent ' + esc(sent) : '') + '</div>'
+      : '<span class="none">no version</span>';
+    const prod = t.production;
+    let playCell;
+    if (prod) {
+      playCell = '<b class="ok">production ' + esc((prod.versionCodes || []).join(',')) + '</b><div class="sub">' + esc(prod.status || '') + '</div>';
+    } else {
+      const rest = [t.beta, t.alpha, t.internal].filter(Boolean)
+        .map((x) => (x.status || '') + ' ' + ((x.versionCodes || []).join(','))).join(' · ');
+      playCell = '<b>no production</b><div class="sub">' + (esc(rest) || 'no tracks') + '</div>';
+    }
+    const cell = (cls, value) => '<td' + (cls ? ' class="' + cls + '"' : '') + '>' + value + '</td>';
+    const st = cur.state || '';
+    const ghCls = (rp.unpushed || rp.dirty) ? 'redo' : 'done';
+    const cloudCls = run.status === 'SUCCEEDED' ? 'done' : 'redo';
+    const appleCls = /REVIEW|READY_FOR_SALE|PENDING_DEVELOPER_RELEASE|PROCESSING_FOR_APP_STORE/.test(st) ? 'done' : 'redo';
+    const playCls = prod ? 'done' : 'redo';
+    const tst = tested[r.slug];
+    const testCls = !tst ? 'redo' : (tst.full ? 'done' : 'part');
+    return '<tr>' +
+      cell('papp', '<div class="pname"><img src="icons/' + r.slug + '.png" alt=""><span>' + esc(r.name) + '</span></div><div class="ver">' + esc(OWNER[r.slug] || '') + '</div>') +
+      cell(ghCls, gh) + cell(cloudCls, cloud) + cell(appleCls, appleCell) + cell(playCls, playCell) +
+      cell(testCls, testedCell(tst)) + cell('redo', esc(nextStep(r))) + '</tr>';
+  }).join('\n');
 
   const cards = rows.map((r) => {
     const a = r.apple || {};
@@ -521,8 +700,16 @@ function renderPage(payload) {
     '</div><div class="ver">' + esc(r.apple && r.apple.current ? r.apple.current.version : 'no version') + '</div></div></div></td>' +
     '<td><div class="green">' + inPlace(r) + '</div></td></tr>').join('\n');
 
-  const gv = Object.entries(g.version || {});
-  const logHtml = readLog(10).map((l) => {
+  const reviewCards = rows.map((r) => {
+    const ri = reviewInfo(r);
+    const line = (label, o) =>
+      '<p class="revline"><span class="rvl">' + label + '</span><span class="revst ' + o.tone + '">' + esc(o.label) + '</span><span class="revtx">' + esc(o.text) + '</span></p>';
+    return '<div class="revbox">\n      <div class="revhead"><img src="icons/' + r.slug + '.png" alt=""><span class="nm">' + esc(r.name) + '</span></div>\n      ' +
+      line('Apple', ri.apple) + '\n      ' + line('Google Play', ri.play) + '\n    </div>';
+  }).join('\n');
+  const sentCount = rows.filter((r) => reviewInfo(r).apple.tone === 'review').length;
+
+  const gv = Object.entries(g.version || {});  const logHtml = readLog(10).map((l) => {
     const i = l.indexOf(' · ');
     return '<div><span>' + esc(i > 0 ? l.slice(0, i) : '') + '</span> — ' + esc(i > 0 ? l.slice(i + 3) : l) + '</div>';
   }).join('\n      ') || '<div><span>—</span> — no run logged yet</div>';
@@ -532,12 +719,12 @@ function renderPage(payload) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
 <meta http-equiv="refresh" content="300">
 <title>Four apps — what is missing</title>
 <style>
-  :root{ --ink:#f2f4f6; --muted:#a8b0ba; --line:#3d4249; --bg:#24272b; --card:#2c3036;
-         --red:#ff8078; --amber:#ffc857; --green:#63df9d; }
+  :root{ --ink:#14171b; --muted:#5c646f; --line:#dfe3e8; --bg:#f7f8fa; --card:#ffffff;
+         --red:#c0261f; --amber:#8a5a00; --green:#0b7a45; }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);padding:30px 20px 50px;
        font:17.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
@@ -554,42 +741,79 @@ function renderPage(payload) {
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
   .mlist{background:var(--card);border-radius:16px;padding:16px 18px;border:1px solid var(--line)}
   .mhead{display:flex;align-items:center;gap:12px;margin-bottom:10px}
-  .mhead img{width:44px;height:44px;border-radius:11px;border:1px solid #4a515a}
+  .mhead img{width:44px;height:44px;border-radius:11px;border:1px solid #d7dce3}
   .nm{font-weight:800;font-size:18px;line-height:1.15}
   .ver{color:var(--muted);font-size:13.5px;font-weight:650}
-  .own{color:#cfd6de;font-size:13px;font-weight:700;margin-top:2px}
+  .own{color:#5c646f;font-size:13px;font-weight:700;margin-top:2px}
   .item{display:flex;gap:10px;align-items:baseline;margin:0 0 7px;font-size:16.5px;font-weight:600}
   .item:last-child{margin-bottom:0}
   .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto;transform:translateY(-1px)}
-  .dr{background:#ff6f66} .da{background:#ffc857} .dg{background:#63df9d}
+  .dr{background:#d9483d} .da{background:#d19a00} .dg{background:#17a35e}
   .r{color:var(--red);font-weight:800} .a{color:var(--amber);font-weight:800} .g{color:var(--green);font-weight:800}
-  .goalline{background:#1e2a3a;border-radius:12px;padding:10px 13px;margin:12px 0 0;font-size:16.5px;font-weight:700;line-height:1.35;color:#e8f1ff;border-left:5px solid #5aa9ff}
+  .goalline{background:#eaf2ff;border-radius:12px;padding:10px 13px;margin:12px 0 0;font-size:16.5px;font-weight:700;line-height:1.35;color:#14212f;border-left:5px solid #2f6fd0}
   .goalline .gl{display:inline-block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;color:#0b2239;background:#5aa9ff;border-radius:99px;padding:2px 8px;margin-right:7px;transform:translateY(-2px)}
-  .nextline{background:#1f3a2c;border-radius:12px;padding:10px 13px;margin:12px 0 0;font-size:16.5px;font-weight:700;line-height:1.35;color:#eefbf3;border-left:5px solid #63df9d}
-  .nextline .nx{display:inline-block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;color:#0d2d1c;background:#63df9d;border-radius:99px;padding:2px 8px;margin-right:7px;transform:translateY(-2px)}
+  .nextline{background:#e7f7ee;border-radius:12px;padding:10px 13px;margin:12px 0 0;font-size:16.5px;font-weight:700;line-height:1.35;color:#0f2417;border-left:5px solid #17a35e}
+  .nextline .nx{display:inline-block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;color:#ffffff;background:#17a35e;border-radius:99px;padding:2px 8px;margin-right:7px;transform:translateY(-2px)}
   .note{color:var(--muted);font-size:14px;font-weight:600;margin:9px 0 0}
   .scroll{background:var(--card);border-radius:16px;overflow-x:auto;border:1px solid var(--line)}
-  table{border-collapse:collapse;width:100%;min-width:820px}
+  table{border-collapse:collapse;width:100%;min-width:0}
   thead th{font-size:12.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
-           font-weight:800;text-align:left;padding:14px 18px 10px;border-bottom:1px solid var(--line);background:#31363c}
+           font-weight:800;text-align:left;padding:14px 18px 10px;border-bottom:1px solid var(--line);background:#eef1f5}
   tbody td{padding:16px 18px;border-bottom:1px solid var(--line);vertical-align:middle}
   tbody tr:last-child td{border-bottom:0}
-  .appcell{display:flex;align-items:center;gap:12px;min-width:230px}
-  .appcell img{width:42px;height:42px;border-radius:10px;border:1px solid #4a515a}
+  .appcell{display:flex;align-items:center;gap:12px;min-width:0}
+  .appcell img{width:42px;height:42px;border-radius:10px;border:1px solid #d7dce3}
   .appcell .nm{font-size:16.5px}
-  .green{color:#dde3ea;font-size:15.5px;line-height:1.6;font-weight:600}
+  .green{color:#14171b;font-size:15.5px;line-height:1.6;font-weight:600}
   .green b{color:var(--green);font-weight:800}
   .twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:720px){.twocol{grid-template-columns:1fr}}
   .box{background:var(--card);border-radius:16px;padding:16px 18px;border:1px solid var(--line)}
   .box h3{font-size:17px;margin:0 0 10px;font-weight:800}
   .box ol,.box ul{margin:0;padding-left:22px;font-size:16px;font-weight:600}
   .box li{margin:6px 0}
-  .log{font-size:15px;font-weight:600;color:#dde3ea}
+  .log{font-size:15px;font-weight:600;color:#14171b}
   .log div{margin:4px 0}
   .log span{color:var(--muted);font-weight:700}
   .foot{color:var(--muted);font-size:14px;font-weight:600;margin-top:18px}
-  .pagetab{display:inline-block;background:#343a42;border:1px solid #6b7684;color:#eef3f8;text-decoration:none;font-size:17.5px;font-weight:800;padding:14px 24px;border-radius:14px}
-  .pagetab:hover{background:#3f4650;border-color:#8b97a6}
+  .pagetab{display:inline-block;background:#ffffff;border:1px solid #c9d0d9;color:#14171b;text-decoration:none;font-size:17.5px;font-weight:800;padding:14px 24px;border-radius:14px}
+  .pagetab:hover{background:#f0f3f7;border-color:#98a3b0}
+  .revbox{background:var(--card);border-radius:16px;padding:14px 16px;border:1px solid var(--line)}
+  .revhead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  .revhead img{width:34px;height:34px;border-radius:9px;border:1px solid #d7dce3}
+  .revline{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin:0 0 9px;font-size:15.5px;font-weight:600;line-height:1.4}
+  .revline:last-child{margin-bottom:0}
+  .rvl{flex:0 0 96px;color:var(--muted);font-size:12.5px;letter-spacing:.07em;text-transform:uppercase;font-weight:800}
+  .revst{border-radius:99px;padding:3px 10px;font-size:12.5px;font-weight:800;letter-spacing:.04em;text-transform:uppercase}
+  .revst.review{background:#ffe7a3;color:#4a3200}
+  .revst.ok{background:#c9f2da;color:#064a26}
+  .revst.draft{background:#eef1f5;color:#3b434d;border:1px solid #c9d0d9}
+  .revst.muted{background:#eef1f5;color:#6b7480}
+  .revtx{flex:1 1 100%;color:#14171b}
+  .sub{color:var(--muted);font-size:12.5px;font-weight:650;margin-top:2px}
+  .ptablewrap{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .ptable{width:100%;max-width:100%;border-collapse:collapse;table-layout:fixed;font-size:11.5px}
+  .ptable th{background:#eef1f5;color:#3b434d;font-size:10px;letter-spacing:.05em;text-transform:uppercase;text-align:left;font-weight:800;padding:9px 6px;border-bottom:1px solid var(--line);vertical-align:bottom}
+  .ptable td{padding:9px 6px;vertical-align:top;border-bottom:1px solid var(--line);font-weight:650;line-height:1.35;word-break:break-word;overflow-wrap:anywhere;hyphens:auto}
+  .ptable tr:last-child td{border-bottom:0}
+  .ptable tr:nth-child(even) td{background:#fafbfc}
+  .ptable th:nth-child(1){width:12%} .ptable th:nth-child(2){width:13%} .ptable th:nth-child(3){width:11%}
+  .ptable th:nth-child(4){width:17%} .ptable th:nth-child(5){width:15%} .ptable th:nth-child(6){width:18%} .ptable th:nth-child(7){width:14%}
+  .ptable td b{font-weight:800}
+  .ptable td.done{background:#e9f8ef;box-shadow:inset 3px 0 0 #1c9d57}
+  .ptable td.redo{background:#fdecea;box-shadow:inset 3px 0 0 #d63b32}
+  .ptable td.part{background:#fff6e0;box-shadow:inset 3px 0 0 #d99100}
+  .ptable td.done .sub,.ptable td.redo .sub,.ptable td.part .sub{color:#3b434d}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:10px 0 14px;font-size:13px;font-weight:700;color:#3b434d}
+  .legend i{display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px}
+  .pname{display:flex;align-items:center;gap:6px;font-weight:800;font-size:12.5px;line-height:1.25}
+  .pname img{width:22px;height:22px;border-radius:6px;flex:0 0 22px}
+  @media (max-width:640px){.ptable{font-size:10px}.ptable td{padding:7px 4px}.ptable th{padding:7px 4px;font-size:9px}.pname{font-size:11px}.pname img{width:18px;height:18px;flex:0 0 18px}.ptable td .sub{font-size:9px}}
+  .ok{color:#0b7a45} .bad{color:#c0261f} .none{color:var(--muted);font-weight:650}
+  .tst{display:inline-block;border-radius:99px;padding:4px 10px;font-size:13px;font-weight:800}
+  .tst.yes{background:#d9f5e5;color:#064a26}
+  .tst.part{background:#fff2cf;color:#6b4400}
+  .tst.no{background:#eef1f5;color:#5c646f}
 </style>
 </head>
 <body>
@@ -598,6 +822,24 @@ function renderPage(payload) {
   <h1>What is missing, app by app</h1>
   <p class="stamp">Checked ${esc(checked)} America/Chicago · Apple API, Google Play API, Xcode Cloud API, folders on the Mac</p>
   <div class="bar"></div>
+
+  <h2>All in one look — GitHub · Xcode Cloud · App Store · Google Play</h2>
+  <p class="note">One table, five apps, read from the four systems on this run — laid out to read down a portrait page, every cell wraps, nothing scrolls sideways. The tested column says who tested it and when; "not checked" means no full pass is recorded yet.</p>
+  <div class="legend"><span><i style="background:#e9f8ef;box-shadow:inset 3px 0 0 #1c9d57"></i>Green = done</span><span><i style="background:#fdecea;box-shadow:inset 3px 0 0 #d63b32"></i>Red = still to do</span><span><i style="background:#fff6e0;box-shadow:inset 3px 0 0 #d99100"></i>Amber = started, not finished</span></div>
+  <div class="ptablewrap">
+    <table class="ptable">
+      <thead><tr><th>App</th><th>GitHub</th><th>Xcode Cloud</th><th>App Store</th><th>Google Play</th><th>Tested fully</th><th>What is left</th></tr></thead>
+      <tbody>
+${oneLook}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>In review and sent — Apple and Google</h2>
+  <p class="note">${sentCount ? sentCount + ' app with Apple’s reviewers right now' : 'No app is with the store reviewers right now'} · read from the Apple and Google Play APIs on this run</p>
+  <div class="grid">
+${reviewCards}
+  </div>
 
   <h2>Missing now — <span class="count">${totalRed} block the store</span> · ${totalAmber} one thing short</h2>
   <div class="grid">

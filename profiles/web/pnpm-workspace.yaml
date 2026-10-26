@@ -7,3 +7,18 @@ allowBuilds:
   node-pty: true
   cloudflared: true
   '@wxg-prc-cpg/browser-skill-dsh-plugin@https://codeload.github.com/Tencent/BrowserSkill/tar.gz/3c5f838c56b5f5f20632804bab83b8a98fea5bf2#path:/packages/dsh-plugin-browserskill': true
+  cpu-features: set this to true or false
+  ssh2: set this to true or false
+minimumReleaseAgeExclude:
+  - '@linxin666/dsh-client-ui-git-graph'
+  - '@linxin666/dsh-client-ui-skill-explorer'
+  - '@linxin666/dsh-client-ui-task-board'
+  - '@linxin666/dsh-remote-web-ui'
+  - b4a
+  - dsh-context
+  - dsh-dream-skin
+  - '@michengai/dsh-automation@0.1.42 || 0.1.44'
+  - '@vectorize-io/hindsight-coding-agents@0.6.1'
+  - dshmarket@1.47.0 || 1.48.0
+  - '@xmanrui/dsh-im@4.21.0 || 4.21.2 || 4.24.0'
+  - '@liustack/modlens@3.26.2'
