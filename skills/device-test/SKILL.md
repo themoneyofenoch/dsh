@@ -26,6 +26,18 @@ adb devices                             # state "device", not "unauthorized"
 - A phone in `unavailable` is unplugged or locked. Say so, do not retry in a loop.
 - Note the exact identifier you will use, e.g. `00008120-001A5DC90210C01E`.
 
+### The devices that exist on this Mac (checked 2026-11-02)
+
+- Android emulator, AVD name `kalkidan_test` — Android 14, API 34, serial `emulator-5554`.
+  Start it with the `android_boot` tool (`device: "kalkidan_test"`), or
+  `$ANDROID_HOME/emulator/emulator -avd kalkidan_test &`. `android_devices` lists whatever is
+  live and the AVD names that can be booted; read it first rather than assuming.
+- An emulator is a pretend Android phone running on this Mac: the same Android system and the
+  same APK, no hardware. Testing there is real testing of the app, not a simulation of it —
+  but say plainly that it is an emulator when reporting, never "a phone".
+- A real iPhone or Android phone only appears when Ammaniel plugs it in. If none is attached,
+  say so and test on the emulator instead of waiting.
+
 ## 3. Build the build that ships
 
 - Prefer the project's own pipeline: `~/.dsh/bin/storeship state` first, then `build`.
@@ -85,3 +97,21 @@ Link the report by full path, never `~`, and keep it outside `.dsh` — the view
 - Maestro 2.11.0 runs Android phones and simulators only ("Physical iOS devices are not yet supported"); use it for Android flow scripts, run with `JAVA_HOME=/opt/homebrew/opt/openjdk@17`.
 - App Review Submit, version bumps, ISBNs and purchases stay Ammaniel's click.
 - Playwright and Maestro drive their own browsers/devices — never his Safari tabs.
+
+## Daily self-check — do it without being told
+
+Ammaniel, 2026-11-02: *"Do the full check on your app yourself — do not wait for me to tell you."*
+
+Once a day, on your own app:
+
+1. Open the real app (phone or emulator, and the web) and tap one flow nobody has tapped yet:
+   sign-up, sign-in each way, password reset, delete account, filters, purchases,
+   notifications, chat, block and report, sign out and back in.
+2. Write down in plain words what worked and what broke, with one picture per fault.
+3. Check both stores (App Store and Google Play) for what changed and what waits on him.
+4. Never guess. If you did not look, say "not checked".
+5. Ask him only for: a version number, a versionCode, an upload, a push to main, or a Submit
+   press. Everything else: fix it, or hand it to the Bot that codes it, with proof.
+6. One question at a time, and nothing else in that message.
+
+Report short: what you checked, what broke, what you fixed, and the one thing he does next.

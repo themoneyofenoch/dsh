@@ -50,7 +50,7 @@
 - id: agent-default-model
   name: '@deepseek-ai/dsh-agent-default-model'
   config:
-    provider: deepseek-official
+    provider: deepseek-account
     model: deepseek-flash
     reasoningEffort: high
 - id: jobs
@@ -390,6 +390,7 @@
         - TIMEOUT
         - TRANSPORT
         - MALFORMED_RESPONSE
+    models: []
 - id: llm-deepseek-account
   name: '@deepseek-ai/dsh-llm-deepseek-account'
   config:
@@ -530,7 +531,7 @@
   name: '@deepseek-ai/dsh-client-ui-theme'
   config:
     preference: dark
-    fontSize: 20
+    fontSize: 21
     codeFontSize: 14
     terminalFontSize: 18
 - id: locale
@@ -1262,13 +1263,6 @@
       - id: tool-plugin-market
         name: '@deepseek-ai/dsh-plugin-market/tools'
         disabled: !!js '!ctx.get(''profileContext'')'
-- id: experimental-inspector
-  name: '@deepseek-ai/dsh-experimental-inspector'
-  disabled: false
-  config:
-    captureFetch: true
-- id: session-inspector
-  name: '@deepseek-ai/dsh-experimental-session-inspector'
 - id: dsh-market
   name: dshmarket
 - id: agent-team
@@ -1285,10 +1279,6 @@
     forkProvider: fork
 - id: ui-agent-team
   name: '@deepseek-ai/dsh-experimental-client-ui-agent-team'
-- id: math-snippets
-  name: dsh-math-snippets
-- id: auto-review
-  name: '@deepseek-ai/dsh-experimental-auto-review'
 - id: speech-to-text
   name: '@deepseek-ai/dsh-experimental-speech-to-text'
   config:
@@ -1301,6 +1291,15 @@
   name: '@deepseek-ai/dsh-experimental-api-speech-to-text'
 - id: ui-voice-input
   name: '@deepseek-ai/dsh-experimental-client-ui-voice-input'
+- id: auto-review
+  name: '@deepseek-ai/dsh-experimental-auto-review'
+- id: experimental-inspector
+  name: '@deepseek-ai/dsh-experimental-inspector'
+  disabled: false
+  config:
+    captureFetch: true
+- id: session-inspector
+  name: '@deepseek-ai/dsh-experimental-session-inspector'
 - id: better-sidebar
   name: dsh-better-sidebar
   disabled: !!js >-
@@ -1312,24 +1311,13 @@
       sidechat: true
       editor: true
       diff: true
-- id: dsh-ios
-  name: '@zseven-w/dsh-ios'
 - id: dsh-android
   name: '@zseven-w/dsh-android'
-- id: ui-task-board
-  name: '@linxin666/dsh-client-ui-task-board'
 - id: dsh-remote
   name: dsh-remote
   disabled: true
-- id: bot
-  name: ds-bot
-  config:
-    checkRatio: 0.269
-    browserPlugin: task
-- id: web-search-auto
-  name: ds-bot/web-search
-- id: dsh-context
-  name: dsh-context
+- id: dsh-ios
+  name: '@zseven-w/dsh-ios'
 - id: ds-harness-remote
   name: ds-harness-remote
   disabled: !!js |-
@@ -1417,9 +1405,23 @@
   name: billion-context
 - id: bili-compaction-gate
   name: billion-context/dsh-compaction-gate
-- id: our-free-model
-  name: dsh-our-free-model
-  config: {}
+- id: dsh-context
+  name: dsh-context
+- id: claude-design
+  name: dsh-claude-design
+- id: claude-design-system
+  name: dsh-claude-design-system
+- id: claude-dashboard
+  name: dsh-claude-dashboard
+- id: bot
+  name: ds-bot
+  config:
+    checkRatio: 0.6309
+    browserPlugin: task
+- id: web-search-auto
+  name: ds-bot/web-search
+- id: xmanrui-dsh-im
+  name: '@xmanrui/dsh-im'
 - id: prompt-layer
   name: >-
     file:///Users/nakfaai/.dsh/profiles/desktop/plugins/dsh-prompt-layer/lib/index.js

@@ -16,6 +16,7 @@ My own persistent agent file (this is MINE, stored in my own repo).
   One line per field, nothing else in the block — no log, no prose. In the Bot's **own chat** it may put the same question on an **`ask_user` card** (🟢 own pick before the letter); **never** in a group. Then it stops and waits — and it does **not** ask again for a permission Ammaniel already granted that Bot (check before asking: full access on the Bot ends this). The permission request is the only text on that turn.
 - **DRAWING OR BUILDING ANY UI? READ `~/.dsh/DESIGN.md` FIRST.** (2026-10-18, after the Latindance card rounds) It is the approved look: black field `#000000`, colour only on lines and buttons, no borders, the five neon stops (`#2ee6a8 #22d3ee #ffd447 #ff9e3d #ff3d6e #ff3d7f #c22bff`), real flyer before designed art, and the card anatomy he signed off. Show him a picture of a new screen before building it.
 - **ALWAYS read this file `~/.dsh/agents.md` at the start of every session/task.** Check rules, preferences, notes first — never skip.
+- **HAND WIDE JOBS TO SUBAGENTS — THEY KEEP YOUR CHAT SMALL AND FAST.** (Ammaniel, 2026-10-27: *"i want the bots to have subagents"*) Every Bot has the `subagent` and `subagent_fork` tools and uses them by itself, no ask needed. When a job reads more than about 5 files, searches wide, or needs research in several places, split it: **one helper per file or per question, up to 3 at once**. Put the whole job in the helper's first message — a `subagent` starts empty, `subagent_fork` already knows this chat. Merge the answers yourself and report once. A helper is one level deep and cannot start its own. Small work stays solo: the helper is for reading that would otherwise fill your chat with text you only need the answer from.
 - **WORKING ON A BOOK? READ `~/Developer/projects/Books/AGENTS.md` FIRST.** (2026-10-02) Any task that touches anything under `~/Developer/projects/Books/` — a manuscript, a cover, a KDP listing — requires that file. It carries the book list, the order of checks (**text first**, then build, paper, cover), the `check-fragments.py` text checker and its `--selftest`, and the rules for handling the author's words and his ISBNs. It is symlinked into every book folder, so it loads automatically when a session starts there; this line is the belt for sessions that start somewhere else.
 - **ALWAYS exclude `node_modules` when pushing anything to GitHub.** "always without node" (Ammaniel, 2026-08-24). Never commit node_modules — reproducible from lockfile, hundreds of MB. Applies everywhere, no exceptions.
 - **Secrets never go to GitHub.** `.credentials.yaml`, `.env*`, tokens, keys — always gitignored, even on private repos.
@@ -83,6 +84,13 @@ When each home is read: this file and project files at the **first request of a 
 
 The oppressed are never described only by what they did — always also by what they were trying to get. Applies to every book, article, post and caption. Three questions and worked examples: skill `purpose-pass`.
 
+## SELF-CHECK YOUR APP — DO IT YOURSELF (rule)
+
+Ammaniel, 2026-11-02: *"Do the full check on your app yourself — do not wait for me to tell you."*
+Check your own app every day without being asked. Ask him only for a version number, a versionCode, an upload, a push to main, or a Submit press — everything else: fix it, or hand it to the Bot that codes it, with proof. Never guess; if you did not look, say "not checked".
+Report short: what you checked, what broke, what you fixed, and the one thing he does next.
+The step-by-step procedure lives in the skill `device-test` (for a Bot that owns or tests an app).
+
 ## Current Focus
 
 Two tracks every day — the corporate-headshots funnel ads, then the two books. The current list: /Users/nakfaai/.dsh/FOCUS.md
@@ -101,7 +109,7 @@ Two tracks every day — the corporate-headshots funnel ads, then the two books.
 
 - (2026-09-19) **"SEND IT TO THE IPHONE" = DIRECT DEVICE INSTALL, NEVER TESTFLIGHT.** (Ammaniel, verbatim: "no send it to the iPhone in the future till I tell you do it to TestFlight".) When he says send/open/put the app on the iPhone, archive Release and install straight to his device with `xcrun devicectl device install app`. Do NOT upload to TestFlight unless he explicitly says "TestFlight" or "build N". **(2026-10-16) STANDING PERMISSION — the install never needs asking.** (verbatim: *"you can alwasy send it to the phone dont ask"*) After any change and its build, put the Release build on the iPhone by myself, no approval card, no "shall I send it" — do it and say it landed. This covers the phone install only: versions, TestFlight, App Store Submit and everything else still ask first.
 
-- (2026-10-06) **APP STORE "SUBMIT" BUTTON = AMMANIEL'S, ONLY AMMANIEL.** (Ammaniel, verbatim, three times: "add to agents.md in .dsh/ submit button with ammaniel" → "unless i say submit button" → "dont submit without askign me .. only me".) **ONLY HE PRESSES SUBMIT.** Never press Submit / Resubmit to App Review on my own initiative, never as the API user, and never because he said "i am in" or "fix it" — those are NOT permission. Do the build, version, metadata, screenshots and validation by API, then **stop** and tell him exactly what to click. **I never submit — not even after a "go" approval of a plan** (2026-10-08, verbatim: "dont submit"). Submitting means: pressing Submit / Resubmit to App Review, AND the API route (PATCH /v1/reviewSubmissions/{id} {submitted:true}, creating a new reviewSubmission). The furthest I go alone: code fixed, build uploaded, build attached to the version, screenshots/metadata/notes ready — then I show him the exact button and wait. I press/submit only if he types it explicitly in that same message ("you submit", "press submit"). In doubt: ask first.
+- (2026-10-06) **APP STORE "SUBMIT" BUTTON = AMMANIEL'S, ONLY AMMANIEL.** (Ammaniel, verbatim, three times: "add to agents.md in .dsh/ submit button with ammaniel" → "unless i say submit button" → "dont submit without askign me .. only me".) **ONLY HE PRESSES SUBMIT.** Never press Submit / Resubmit to App Review on my own initiative, never as the API user, and never because he said "i am in" or "fix it" — those are NOT permission. Do the build, version, metadata, screenshots and validation by API, then **stop** and tell him exactly what to click. **I never submit — not even after a "go" approval of a plan** (2026-10-08, verbatim: "dont submit"). Submitting means: pressing Submit / Resubmit to App Review, AND the API route (PATCH /v1/reviewSubmissions/{id} {submitted:true}, creating a new reviewSubmission). The furthest I go alone: code fixed, build uploaded, build attached to the version, screenshots/metadata/notes ready — then I show him the exact button and wait. I press/submit only if he types it explicitly in that same message ("you submit", "press submit", "go submit", "submit it") — and those words name the act for that app, so they ARE the permission. Then press it once, say what the store answered, and press nothing else. **A room goal's rule never means "never": "never press Submit" reads as "never without his word".** (Ammaniel corrected this on 2026-11-05: a Bot refused a Submit he had already ordered, because it read the goal rule as absolute — his words: if Ammaniel says "go submit" they are allowed.) In doubt: ask first.
 
 - **STORE PRODUCTS ARE THE BOT'S OWN WORK — CREATE THEM AND FILL THEM, NO SECOND ASK.** (Ammaniel, 2026-10-21: *"that you can do it"* → *"add this to agents.md global on .dsh"*) When a Bot is taking an app to the stores, the things that sell inside the app are its job, not his click: in-app purchases, subscriptions, their product ids, reference names, display names, descriptions, prices, country availability, review notes and review screenshots — in **App Store Connect** and in the **Google Play Console**. Tell him what was created, once, in one line; never ask *"who creates it"* or *"shall I create it"*.
   - Apple's API refuses to create a product (`POST /v1/inAppPurchases` → 403 CREATE not allowed), so creation happens in the **web console in his own Safari session** (skill `browser-sandbox`, `~/.dsh/bin/safari`) — Apps → the app → In-App Purchases → + → type, reference name, product id → Create. Prove it in the API afterwards (`/v2/inAppPurchases/{id}`).
@@ -117,7 +125,7 @@ Two tracks every day — the corporate-headshots funnel ads, then the two books.
 - (2026-10-22) **GOOGLE PLAY PRODUCTION IS GATED — CHECK THE TESTER COUNT BEFORE SAYING "READY ON GOOGLE".** A personal Play account needs, per app and in this order: a **published closed testing release**, **12 testers opted in**, **14 days in a row** with those 12 staying opted in, and then **Ammaniel presses Apply for access to production** in the Play Console — no API applies for him. The Play API answers the blocked production track with `400 FAILED_PRECONDITION` (or `500 INTERNAL`) and names nothing, so read the counter on the app's Dashboard page (`play.google.com/console/u/<n>/developers/<devId>/app/<appId>/app-dashboard`, panel "Apply for access to production") before promising a Play launch. Never report a Play release as live on the strength of an internal-testing track. Steps, API limits and the current Netbrew numbers: skill `play-production-access`.
 
 - (2026-10-18) **BUILDS — THE BUILD SHELF, EVERY APP.** One public page lists every app's newest test build: **https://nakfaai.com/builds** (title "Test builds"). Ammaniel triggers it by naming the app — "pixwee to builds" — and the Bot runs `~/.dsh/bin/storeship link` **in that app's folder**: it finds the APK (`android/app/build/outputs/apk/release/app-release.apk`, or `--apk <path>`), copies it to `~/Developer/projects/builds/public/<slug>/`, deploys `firebase deploy --only hosting:builds --project netbrew-b3fdc`, updates `~/Developer/projects/nakfaai/builds/apps.json` (name, version, date, what's new, Android link), commits and pushes `themoneyofenoch/nakfaai` (auto-deploys `/builds`), and prints the live link. Flags: `--dry`, `--app <slug>`, `--name "App name"`, `--notes "one line"`, `--apk <path>`, `--version X`, `--host <url>`. Files live on `builds.nakfaai.com` (Firebase site `nakfaai-builds-files` in project netbrew-b3fdc; free Spark hosting refuses APKs, so it lives in the Blaze project). A new app needs `slug`/`appName` in its `ship.json`. iPhone builds are TestFlight public links only — an open APK link has no iOS twin.
-- (2026-10-18) **STORESHIP — THE APPLE + PLAY PIPELINE EVERY BOT USES.** One tool: `~/.dsh/bin/storeship` (there is no `/bin/storeship`). Commands: `state`, `init`, `listing [--dry]`, `privacy`, `category`, `age`, `rights`, `pricing`, `review`, `shots <dir>`, `build`, `upload`, `attach`, `testflight`, `validate`, plus the Google Play set: `play-state`, `play-init` (app details/contact), `play-listing [--show|--dry]`, `play-shots <dir> [--type=phoneScreenshots]`, `play-bundle <aab>`, `play-track <track> [versionCodes…] [--status=draft|inProgress|completed] [--rollout=10] [--notes=file] [--dry]`, `play-notes <track> <file>`. Every Play write takes `--dry`, and a production release stays `draft` until Ammaniel says `--publish` — committing a production track starts Play review, so that stays his click. Per-app settings live in the project's `ship.json` (bundleId, SKU, notes, screenshot dir); App Store Connect key `~/Developer/private_keys/AuthKey_DASF43QDRT.p8`, key id `DASF43QDRT`, issuer `0418454e-4e54-4fc7-a387-b3b2460fd5e8`. Start every Apple/Play shipping task with `~/.dsh/bin/storeship state` — it reports what Apple sees and stops before review, so **Submit stays Ammaniel's click**.
+- (2026-10-18) **STORESHIP — THE APPLE + PLAY PIPELINE EVERY BOT USES.** One tool: `~/.dsh/bin/storeship` (there is no `/bin/storeship`). Commands: `state`, `init`, `listing [--dry]`, `privacy`, `category`, `age`, `rights`, `pricing`, `review`, `shots <dir>`, `build`, `upload`, `attach`, `testflight`, `validate`, plus the Google Play set: `play-state`, `play-init` (app details/contact), `play-listing [--show|--dry]`, `play-shots <dir> [--type=phoneScreenshots]`, `play-bundle <aab>`, `play-track <track> [versionCodes…] [--status=draft|inProgress|completed] [--rollout=10] [--notes=file] [--dry]`, `play-notes <track> <file>`. Every Play write takes `--dry`, and a production release stays `draft` until Ammaniel says `--publish` — committing a production track starts Play review, so that stays his click. Per-app settings live in the project's `ship.json` (bundleId, SKU, notes, screenshot dir); App Store Connect key `~/Developer/private_keys/AuthKey_DASF43QDRT.p8`, key id `DASF43QDRT`, issuer `0418454e-4e54-4fc7-a387-b3b2460fd5e8`. Start every Apple/Play shipping task with `~/.dsh/bin/storeship state` — it reports what Apple sees and stops before review, so **Submit stays Ammaniel's click unless he says "go submit"**.
 
 ## TESTFLIGHT — PUBLIC LINK + QR (rule)
 
@@ -125,7 +133,7 @@ Testers join by one public link and a QR, never a manual email list. Full App St
 
 ## XCODE CLOUD — one connection per app (rule)
 
-Apple’s machines build every app: a shared scheme, `ci_scripts` beside the `.xcodeproj`, the Node/pnpm pattern, and a push to `main` starts the build. Versions and build numbers move only on Ammaniel’s yes; Submit stays his click. Full steps, failure signatures and status: skill `xcode-cloud`.
+Apple’s machines build every app: a shared scheme, `ci_scripts` beside the `.xcodeproj`, the Node/pnpm pattern, and a push to `main` starts the build. Versions and build numbers move only on Ammaniel’s yes; Submit stays his click unless he says "go submit". Full steps, failure signatures and status: skill `xcode-cloud`.
 
 ## Stack & Environment
 
@@ -135,6 +143,10 @@ Apple’s machines build every app: a shared scheme, `ci_scripts` beside the `.x
 ## BROWSER — SAFARI ONLY, ONE BOT TAB AT A TIME (rule)
 
 Ammaniel uses Safari only. `~/.dsh/bin/safari` drives his real Safari, one tab per Bot under a lock; never touch a tab it did not open, never run raw `osascript`, never open a new window. Apple Events need the sandbox off; Playwright Chromium is only for headless checks. Every limit and tool flag: skill `browser-sandbox`.
+
+- **A BOT BROWSES IN SAFARI, NEVER CHROME.** (Ammaniel, 2026-10-27) The `browser_task` / `browser_open` / `browser_click` tools open a Playwright **Google Chrome for Testing** window — that is Chrome, so a Bot does not use them. Web work goes through `~/.dsh/bin/safari` (`open`, `map`, `text`, `click`, `type`, `fill`, `shot`) on the Bot's own marked tab; his own tabs are never touched. `read_browser` stays for reading a page he has open, `sidebar_open` for showing him a file.
+- **EVERY BOT HAS FULL BROWSER ACCESS.** (Ammaniel, 2026-11-03: *"give all bots full access to the browser"*) Every Bot may drive `~/.dsh/bin/safari` without asking anyone: open a page, read it, click, type, fill a form, upload a file, take a screenshot — on its own Bot tab. No Bot needs permission from Manager or from him to browse. The limits that stay: one Bot tab at a time under the lock, never touch a tab the Bot did not open, never Chrome or Playwright, and Instagram stays sidebar-only (section below).
+
 
 ## BRANCHES — app code on a branch, main stays live (rule)
 
@@ -155,9 +167,49 @@ The Bot that makes a change runs **one check of that change before it pushes**, 
 
 The feature Bot never runs the full suite: **Tester** owns the complete E2E run, and that run belongs before a release, not before every push. A change with no check is not done, and the Bot names the check it ran in one plain line.
 
+## 💳 MONEY AND AI ARE NOT DONE WHEN THEY ARE BUILT (rule)
+
+(Ammaniel, 2026-11-05: *"for eg kalkidan .. the payment was not done. ai functions was not done, the bot never tested them"*.)
+
+**"Done" on a paid flow — payment, subscription, purchase, restore — or on an AI feature means tapped end to end and seen on the screen.** Not compiled, not merged, not "the code is in". A Bot that says done here without the tap is wrong, and the claim is thrown back.
+
+Every report on such a feature carries one PROOF line per claim, in this shape:
+
+`PROOF: <what was tapped> · <device, or which store/sandbox account> · <screenshot or log path>`
+
+No PROOF line means **not tested** — write those two words, never "done". Reading the code is "not checked". Mocking the payment sheet is "not checked".
+
+- **Payment:** tap the real buy button with a real store account or a sandbox tester account, say which one, and quote what the screen said after paying — then say what the purchase unlocked. Also tap restore, and tap cancel.
+- **AI:** send one real request, show the real answer, then show the failure case (no network, bad key) and what the app says.
+- **A flow with no way to pay yet** (no product, no key) is reported as blocked and named, never as done.
+
+This sits on top of the check rule above: the check is the tap, the PROOF line is the receipt.
+
 ## AUTOMATION HANDOFF (rule)
 
 Every scheduled run reads its state file first, does one job only, rewrites that file, and appends one line to `state/LOG.md`. Session rollover at about 40 turns, into `/Users/nakfaai/.dsh/SESSION.md`. Exact shape and rules: skill `automation-handoff`.
+
+## 🔴 EVERY CHAT ROLLS OVER — NO EXCEPTIONS (locked 2026-10-27, Ammaniel: "some of agents here too big, they dont do sessions start new")
+
+A chat is a tool, not a home. A Bot that keeps one chat alive forever gets slow, forgets what matters, and makes Ammaniel repeat himself.
+
+**Trigger — check on every reply:** if the chat is past ~25 of my replies, or I have changed topic twice, or my last request sent more than 150k tokens — I roll over on the NEXT reply. I do not ask permission and I do not finish "one more thing".
+
+**The rollover, in order:**
+1. Write the handoff to `~/.dsh/handoffs/<bot-name>.md` — one file per Bot, so two Bots never overwrite each other. Max 20 lines, exactly this shape:
+   ```
+   # <Bot name> — handoff
+   - Updated: YYYY-MM-DD HH:MM (America/Chicago)
+   - Status: <one line — where the work stands>
+   - Done: <finished items, newest first, one line each>
+   - In flight: <half-done work, or "nothing">
+   - Next: <the single next action>
+   - Blocked: <what Ammaniel must do, or "nothing">
+   ```
+2. Reply to Ammaniel in 3 lines: what is done, what is next, and `start a new chat and say: continue from ~/.dsh/handoffs/<bot-name>.md`.
+3. Stop. No new work in the old chat.
+
+**A new chat reads its own handoff file FIRST**, before anything else, then continues from `Next`. If the file is missing, ask him — never guess the state. `~/.dsh/SESSION.md` stays the one current-session note; the per-Bot file in `~/.dsh/handoffs/` is the one a new chat opens.
 
 ---
 
@@ -209,3 +261,10 @@ He asked a question and got a 378-class study; he had to say "keep it short" bef
 Detail, tables and the whole study open **only** when he types "explain" or "long".
 Him saying "keep it short" is a **defect of the first answer**, not a new instruction. Never make him ask twice.
 Six lines is the cap, not the target — a two-line answer that decides something beats six lines that describe it.
+
+## Instagram — NEVER outside this browser (Ammaniel, 2026-11-03)
+- Instagram work happens ONLY in the app's own sidebar browser panel ("this browser").
+- NEVER drive Instagram in Safari, Chrome, or any other window. No exceptions.
+- Reason: he said it plainly — "never use instagram outside this browser".
+- **THE ACCOUNTS AND THE PASSWORD.** (Ammaniel, 2026-11-03: *"add on books and success group each bots browser instagram.com password ... user: ammaniel_hintza other user: nakfaai same password"*) Any Bot in the "BOOKS 📚📚📚" or "Success" room may log in and post there. Two accounts, one password: `ammaniel_hintza` and `nakfaai`. The password is the saved secret **DSH_SECRET_INSTAGRAM** — read it from the environment (`$DSH_SECRET_INSTAGRAM`). Never type, echo or paste it into a chat, a file, a screenshot or a page you hand over, and never write it into a Bot's instructions. Check which account is logged in and name it before posting. His word still comes first: nothing is posted without his approval of that exact image and caption.
+- **THE GO-TO POSTING PAGES.** (Ammaniel, 2026-11-03: *"save them as your go to .. when ever you post"* — he keeps both on his dock) TikTok: `https://www.tiktok.com/foryou` · Instagram: `https://www.instagram.com/nakfaai/?__pwa=1`. Open one of these first whenever a Bot posts to TikTok or Instagram, on its own Bot tab, never on a tab he opened.

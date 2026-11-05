@@ -13,13 +13,14 @@
 - Blocked: Tester 2 access is set only in the app, by Ammaniel.
 
 # SESSION — netbrew (Bot: netbrew)
-- Updated: 2026-10-20 19:33 (America/Chicago)
-- Status: groups (event rooms) run end to end and are on the iPhone; the two-phone proof waits on the second phone.
+- Updated: 2026-10-26 11:10 (America/Chicago)
+- Status: app is on TestFlight build 8 and Play internal versionCode 6; the café screen can no longer print raw server text, and only the phone install is owed.
 - Done:
-  - Groups follow his spec: list at the place, each group's own page, code or organizer QR to join, ORGANIZER/member skip the page, OFFICIAL at 5 inside.
-  - Closing a group page no longer leaves the group (it ended every new group at once) — proven on the simulator; iPhone seq 6776, Android https://netbrew.app/netbrew-android-v1.apk 107,196,673 bytes.
-  - 8-hour rule live: a group ends at its end time and clears itself away 8 hours later; the scheduled sweep was proven on real rooms.
-  - "Join with a code" removed from the Groups sheet; create failures show in plain words under Create.
-- In flight: none.
-- Next: two-phone test — phone A opens a group, phone B inside joins with the code, phone B outside is refused.
-- Blocked: second iPhone 00008130-00164834087A8D3A reads unavailable; item 1 sign-in flows need Ammaniel's thumb; Play testers wait on the Play app-signing SHA-1.
+  - No screen prints a raw server line: new `plainError.ts`, the 8 raw paths on the café screen, safety actions and account delete go through it, and a test fails if a raw `.message` comes back. main `c2de35d`, CHANGELOG line written.
+  - Suite 81 pass / 0 fail (was 72); type-check clean outside the 4 known `@types/node` test-file errors.
+  - Build 8 on TestFlight with beta review APPROVED (link https://testflight.apple.com/join/8RF2eSWc); Android versionCode 6 / versionName 1.0.1 on Play internal, completed — both from his own numbers yes 8 and 6.
+  - "Here now" is measured: 150 m check-in enforced, his face sits only in rooms he is really in, six cafés seeded with 8 faces each.
+  - Walking out removes presence at once; a 10-minute heartbeat keeps it alive; café counters count only people still there.
+- In flight: Release archive `/tmp/nb-plain.xcarchive` is built; install to his iPhone `00008120-001A5DC90210C01E` refused with `CoreDeviceError 4016` (device locked).
+- Next: install that archive on the iPhone when it unlocks, open the café screen, then report to App Manager in one block.
+- Blocked: iPhone must be unlocked; Tester 2 re-runs create-group on the next build; Play production needs 12 opted-in testers for 14 days then his Apply click; App Review needs a way in for reviewers outside Dallas; Submit stays his click; new build numbers need his yes before the newer UI work ships.
